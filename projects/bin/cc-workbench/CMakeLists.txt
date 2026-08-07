@@ -12,21 +12,14 @@ cc_add_executable(${PROJECT_NAME}
 )
 target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
-# Ship assets (fonts + examples) next to the executable — Hello ImGui loads the
-# fonts via its asset system (exe_dir/assets/...), and the ImFileDialog "Browse"
-# view starts from exe_dir. A stamp file + CONFIGURE_DEPENDS glob re-copies
-# whenever anything under assets/ changes (adding a .tl example, etc.), which a
-# plain POST_BUILD would miss (it only fires on a real target rebuild).
-file(GLOB_RECURSE _cc_wb_assets CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/assets/*")
-set(_cc_wb_stamp "${CMAKE_CURRENT_BINARY_DIR}/assets.copy.stamp")
-add_custom_command(OUTPUT ${_cc_wb_stamp}
+# Ship assets (fonts + examples) next to the executable. An always-run custom
+# target (not a stamp) is used on purpose: extracted/added files often keep an
+# older mtime than a stamp, which would skip the copy. copy_directory every build
+# is cheap (~11 MB, local disk) and guarantees the runtime dir stays in sync.
+add_custom_target(${PROJECT_NAME}_assets ALL
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/assets"
         "$<TARGET_FILE_DIR:${PROJECT_NAME}>/assets"
-    COMMAND ${CMAKE_COMMAND} -E touch ${_cc_wb_stamp}
-    DEPENDS ${_cc_wb_assets}
     VERBATIM
-    COMMENT "Copying cc-workbench assets -> $<TARGET_FILE_DIR:${PROJECT_NAME}>/assets")
-add_custom_target(${PROJECT_NAME}_assets DEPENDS ${_cc_wb_stamp})
+    COMMENT "Syncing cc-workbench assets -> $<TARGET_FILE_DIR:${PROJECT_NAME}>/assets")
 add_dependencies(${PROJECT_NAME} ${PROJECT_NAME}_assets)

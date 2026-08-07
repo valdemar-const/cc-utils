@@ -83,7 +83,7 @@ std::string open_plugin(lib_t& lib, std::string_view name) {
          " not found (set CCP_PLUGIN_PATH or run from the build dir)";
 }
 
-// dlopen + resolve + api-check one side. Empty string = ok.
+// dlopen + resolve + api-check one stage. Empty string = ok.
 template <typename PluginFn>
 std::string resolve(lib_t& so, std::string_view name, std::string_view kind,
                     std::string_view factory_sym, PluginFn& out) {
@@ -96,15 +96,17 @@ std::string resolve(lib_t& so, std::string_view name, std::string_view kind,
   }
   out = so.get<PluginFn()>(std::string{factory_sym}.c_str())();
   return out ? std::string{} : std::string{kind} + " '" + std::string{name} +
-                                   "': missing " + std::string{factory_sym};
+                                    "': missing " + std::string{factory_sym};
 }
 
 }  // namespace
 
 struct pipeline::impl {
   lib_t front_so;
+  lib_t irgen_so;
   lib_t back_so;
   cc::frontend* front = nullptr;
+  cc::ir_generator* irgen = nullptr;
   cc::backend* back = nullptr;
 };
 
@@ -114,16 +116,26 @@ pipeline& pipeline::operator=(pipeline&&) noexcept = default;
 pipeline::~pipeline() = default;
 
 bool pipeline::run(std::string_view source, std::string_view out_path) const {
-  if (!pimpl_->front || !pimpl_->back) return false;
-  cc::ir::module mod;
-  if (!pimpl_->front->compile(source, mod)) return false;
-  return pimpl_->back->emit(mod, out_path);
+  if (!pimpl_->front || !pimpl_->irgen || !pimpl_->back) return false;
+
+  auto ast = pimpl_->front->parse(source);  // source -> erased AST
+  if (!ast) return false;
+
+  cc::ir::module mod;  // the narrow waist: language-neutral from here on
+  if (!pimpl_->irgen->generate(*ast, mod)) return false;
+
+  return pimpl_->back->emit(mod, out_path);  // IR -> target exe
 }
 
 std::expected<pipeline, std::string> pipeline_builder::build() const {
   pipeline::impl state;
   if (auto e = resolve(state.front_so, front_, "frontend", "cc_plugin_frontend",
                        state.front);
+      !e.empty()) {
+    return std::unexpected(std::move(e));
+  }
+  if (auto e = resolve(state.irgen_so, irgen_, "irgen", "cc_plugin_irgen",
+                       state.irgen);
       !e.empty()) {
     return std::unexpected(std::move(e));
   }

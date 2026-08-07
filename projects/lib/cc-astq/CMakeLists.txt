@@ -7,5 +7,4 @@ cc_add_library(${PROJECT_NAME}
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   PUBLIC_HEADERS
     include/cc/astq.hpp
-  # PUBLIC_DEPS  cc-other::cc-other   # wire cross-project links here
-)
+  PUBLIC_DEPS cc-astit::cc-astit cc-ir::cc-ir)

@@ -6,6 +6,6 @@ cc_add_library(${PROJECT_NAME}
   PUBLIC_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   PUBLIC_HEADERS
+    include/cc/any_ast.hpp
     include/cc/astit.hpp
-  # PUBLIC_DEPS  cc-other::cc-other   # wire cross-project links here
 )

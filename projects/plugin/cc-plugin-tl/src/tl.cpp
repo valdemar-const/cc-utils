@@ -1,38 +1,28 @@
 #include <cc/plugin.hpp>
 
-#include <cctype>
+#include <cc/astit.hpp>
+#include <cc/parseit.hpp>
+
+#include <memory>
 #include <string_view>
+#include <utility>
 
 namespace {
+
+// Stage 1: source text -> type-erased tl AST (cc::ast::tl_program).
 class tl_frontend final : public cc::frontend {
  public:
-  bool compile(std::string_view src, cc::ir::module& out) override {
-    // MVP "parser": `return <digits>;` -> module.exit_code. (cc-parseit comes later.)
-    auto pos = src.find("return");
-    if (pos == std::string_view::npos) return false;
-    pos += 6;
-    int v = 0;
-    bool any = false;
-    while (pos < src.size()) {
-      char c = src[pos];
-      if (c >= '0' && c <= '9') {
-        v = v * 10 + (c - '0');
-        any = true;
-      } else if (c == ';') {
-        break;
-      } else if (std::isspace(static_cast<unsigned char>(c))) {
-        // whitespace tolerated
-      } else {
-        return false;
-      }
-      ++pos;
-    }
-    if (!any) return false;
-    out.exit_code = v;
-    return true;
+  std::unique_ptr<cc::IAnyAst> parse(std::string_view src) override {
+    auto prog = cc::parseit::parse(src);
+    if (!prog) return nullptr;
+    auto carrier = std::make_unique<cc::ast::tl_program>();
+    carrier->root = std::make_unique<cc::ast::program>(std::move(*prog));
+    return carrier;  // upcast unique_ptr<tl_program> -> unique_ptr<IAnyAst>
   }
 };
+
 tl_frontend g_instance;
+
 }  // namespace
 
 extern "C" cc::plugin_info cc_plugin_load() {

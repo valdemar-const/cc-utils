@@ -2,15 +2,28 @@
 
 #include "cc-ir_export.hpp"
 
+#include <cstdint>
 #include <string_view>
+#include <vector>
 
 namespace cc::ir {
 
 [[nodiscard]] CC_IR_API std::string_view version() noexcept;
 
-// Minimal IR unit crossing the plugin boundary. Will grow real ops/SSA later.
+// A single three-address-ish operation. The narrow waist of the pipeline:
+// language-specific on the way in (frontend/irgen), target-specific on the way
+// out (backend). Everything between speaks only this.
+enum class opcode : std::uint8_t {
+  ret,  // exit with immediate
+};
+
+struct instr {
+  opcode op = opcode::ret;
+  std::int64_t imm = 0;
+};
+
 struct module {
-  int exit_code = 0;
+  std::vector<instr> code;
 };
 
 }  // namespace cc::ir

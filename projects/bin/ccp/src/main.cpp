@@ -10,6 +10,7 @@
 namespace {
 struct args {
   std::string front;
+  std::string irgen;
   std::string arch;
   std::string input;
   std::string output = "a.out";
@@ -20,6 +21,8 @@ bool parse_args(int argc, char** argv, args& a) {
     std::string_view v = argv[i];
     if (v.starts_with("--front=")) {
       a.front = std::string{v.substr(8)};
+    } else if (v.starts_with("--irgen=")) {
+      a.irgen = std::string{v.substr(8)};
     } else if (v.starts_with("--arch=")) {
       a.arch = std::string{v.substr(7)};
     } else if (v == "-o") {
@@ -27,20 +30,20 @@ bool parse_args(int argc, char** argv, args& a) {
     } else if (v.starts_with("-o")) {
       a.output = std::string{v.substr(2)};
     } else if (v == "--help" || v == "-h") {
-      std::cout << "usage: ccp --front=<lang> --arch=<arch> <input> -o <output>\n";
+      std::cout << "usage: ccp --front=<lang> --irgen=<lang-ir> --arch=<arch> <input> -o <output>\n";
       return false;
     } else {
       a.input = std::string{v};
     }
   }
-  return !a.front.empty() && !a.arch.empty() && !a.input.empty();
+  return !a.front.empty() && !a.irgen.empty() && !a.arch.empty() && !a.input.empty();
 }
 }  // namespace
 
 int main(int argc, char** argv) {
   args a;
   if (!parse_args(argc, argv, a)) {
-    std::cerr << "usage: ccp --front=<lang> --arch=<arch> <input> -o <output>\n";
+    std::cerr << "usage: ccp --front=<lang> --irgen=<lang-ir> --arch=<arch> <input> -o <output>\n";
     return argc <= 1 ? 0 : 1;
   }
 
@@ -54,6 +57,7 @@ int main(int argc, char** argv) {
 
   auto built = cc::pipeit::pipeline_builder{}
                    .front(a.front)
+                   .irgen(a.irgen)
                    .back(a.arch)
                    .build();
   if (!built) {
@@ -66,6 +70,6 @@ int main(int argc, char** argv) {
     return 1;
   }
   std::cout << "ccp: " << a.input << " -> " << a.output << " (front=" << a.front
-            << ", arch=" << a.arch << ")\n";
+            << ", irgen=" << a.irgen << ", arch=" << a.arch << ")\n";
   return 0;
 }

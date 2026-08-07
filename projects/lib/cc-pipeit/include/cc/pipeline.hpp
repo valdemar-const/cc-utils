@@ -29,7 +29,9 @@ class pipeline {
   pipeline(pipeline const&) = delete;
   pipeline& operator=(pipeline const&) = delete;
 
-  // front.compile(source) -> ir::module -> back.emit(out_path).
+  // front.parse(source) -> IAnyAst -> irgen.generate -> ir::module
+  //   -> back.emit(out_path). The AST carries language-specific type info
+  //   between front and irgen; at IR the language link is dropped.
   CC_PIPEIT_API bool run(std::string_view source, std::string_view out_path) const;
 
  private:
@@ -39,14 +41,19 @@ class pipeline {
   pipeline();
 };
 
-// Compiles a pipeline from the named frontend + backend plugins. Fluent:
-//   auto p = pipeline_builder{}.front("tl").back("x86_64").build();
-// build() dlopens both plugins, checks api versions and either returns a ready
-// pipeline or an error string.
+// Compiles a pipeline from the named frontend + ir_generator + backend plugins.
+// Fluent:
+//   auto p = pipeline_builder{}.front("tl").irgen("tl-ir").back("x86_64").build();
+// build() dlopens all three plugins, checks api versions and either returns a
+// ready pipeline or an error string.
 class pipeline_builder {
  public:
   pipeline_builder& front(std::string_view name) {
     front_ = std::string{name};
+    return *this;
+  }
+  pipeline_builder& irgen(std::string_view name) {
+    irgen_ = std::string{name};
     return *this;
   }
   pipeline_builder& back(std::string_view name) {
@@ -58,6 +65,7 @@ class pipeline_builder {
 
  private:
   std::string front_;
+  std::string irgen_;
   std::string back_;
 };
 

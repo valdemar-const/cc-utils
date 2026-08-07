@@ -14,6 +14,7 @@ cc_add_library(${PROJECT_NAME}
     include/cc/pipeline.hpp
   PUBLIC_DEPS
     cc-ir::cc-ir
+    cc-astit::cc-astit
   PRIVATE_DEPS
     Boost::dll
 )

@@ -7,5 +7,4 @@ cc_add_library(${PROJECT_NAME}
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   PUBLIC_HEADERS
     include/cc/gen.hpp
-  # PUBLIC_DEPS  cc-other::cc-other   # wire cross-project links here
-)
+  PUBLIC_DEPS cc-ir::cc-ir)

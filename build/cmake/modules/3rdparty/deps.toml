@@ -43,3 +43,15 @@ version = "1.15.2"
 [dep.Boost]
 package = "Boost"
 version = "1.90.0"
+
+# imgui_bundle — optional overrides (uncomment a line inside the table to enable):
+#   options       = ["OPT=ON", "..."]   # extra CPMAddPackage args
+#   source_subdir = "libs/foo"           # nested CMakeLists in the archive
+#   download_only = false                  # fetch source, skip add_subdirectory; declare targets in `post`
+#   pre  = "..."                          # cmake snippet OR a `.cmake` file ref (before add_subdirectory)
+#   post = "..."                          # (after)
+#   patches = ["name.patch"]              # applied via CPM_PATCH_COMMAND
+#   aliases = { "pkg::x" = "X" }
+[dep.imgui_bundle]
+package = "imgui_bundle"
+version = "1.92.801"

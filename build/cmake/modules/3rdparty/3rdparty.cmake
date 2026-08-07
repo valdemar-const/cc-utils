@@ -204,3 +204,6 @@ cpm_declare_fallback(KEY Boost TIER loc URL ${CPM_PRELOAD}/boost-1.90.0.zip HASH
 cpm_declare_package(KEY GTest PACKAGE GTest VERSION 1.15.2 OPTIONS OVERRIDE_FIND_PACKAGE)
 cpm_declare_fallback(KEY GTest TIER git WHEN CPM_FETCH GIT https://github.com/google/googletest.git TAG v1.15.2 OPTIONS GIT_SHALLOW ON)
 cpm_declare_fallback(KEY GTest TIER loc URL ${CPM_PRELOAD}/gtest-1.15.2.zip HASH SHA256=78b886a1786d9683d9877b039816cd246696b0934b77eb14f58c3806a43aff74)
+cpm_declare_package(KEY imgui_bundle PACKAGE imgui_bundle VERSION 1.92.801 OPTIONS OVERRIDE_FIND_PACKAGE)
+cpm_declare_fallback(KEY imgui_bundle TIER git WHEN CPM_FETCH GIT git@github.com:pthom/imgui_bundle.git TAG v1.92.801 OPTIONS GIT_SHALLOW ON)
+cpm_declare_fallback(KEY imgui_bundle TIER loc URL ${CPM_PRELOAD}/imgui_bundle-1.92.801.zip HASH SHA256=9ab2d52ee7da3446122507130e097b6c96f4506b7b8e81332af439273311407e)

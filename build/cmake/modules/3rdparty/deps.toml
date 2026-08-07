@@ -1,0 +1,45 @@
+# cpm project manifest. Layers: global pantry ($CPM_HOME/deps.toml) is the base,
+# this file overlays it (more local wins). After editing (from project root): cpm generate
+project      = "project"
+network_when = "CPM_FETCH"            # configure-time predicate gating git/tar tiers
+# patch_prefix = "${PROJECT_SOURCE_DIR}/build/patches"   # where <archive-base>/<name>.patch files live
+# To override the patch tool (e.g. on Windows), in configure.cmake:
+#   set(CPM_PATCH_COMMAND "${Python3_EXECUTABLE} -m patch -p1" CACHE STRING "" FORCE)
+
+# simple: pantry keys included as-is
+# deps = ["fmt", "glm"]
+
+# rich: per-dep override table. Examples:
+# [dep.boost]
+# package = "Boost"; git = false
+# tarball = "https://github.com/boostorg/boost/releases/download/boost-1.87.0/boost-1.87.0-cmake.tar.xz"
+# options = ["EXCLUDE_FROM_ALL YES", "OVERRIDE_FIND_PACKAGE"]
+# pre = ''' ...emscripten-only cmake... '''
+# [dep.stb]            # synthetic, target-only
+# package = "STB"; no_source = true
+# post = '''add_library(stb::headers ALIAS stb_headers)'''
+deps = []
+
+# GTest — optional overrides (uncomment a line inside the table to enable):
+#   options       = ["OPT=ON", "..."]   # extra CPMAddPackage args
+#   source_subdir = "libs/foo"           # nested CMakeLists in the archive
+#   download_only = false                  # fetch source, skip add_subdirectory; declare targets in `post`
+#   pre  = "..."                          # cmake snippet OR a `.cmake` file ref (before add_subdirectory)
+#   post = "..."                          # (after)
+#   patches = ["name.patch"]              # applied via CPM_PATCH_COMMAND
+#   aliases = { "pkg::x" = "X" }
+[dep.GTest]
+package = "GTest"
+version = "1.15.2"
+
+# Boost — optional overrides (uncomment a line inside the table to enable):
+#   options       = ["OPT=ON", "..."]   # extra CPMAddPackage args
+#   source_subdir = "libs/foo"           # nested CMakeLists in the archive
+#   download_only = false                  # fetch source, skip add_subdirectory; declare targets in `post`
+#   pre  = "..."                          # cmake snippet OR a `.cmake` file ref (before add_subdirectory)
+#   post = "..."                          # (after)
+#   patches = ["name.patch"]              # applied via CPM_PATCH_COMMAND
+#   aliases = { "pkg::x" = "X" }
+[dep.Boost]
+package = "Boost"
+version = "1.90.0"

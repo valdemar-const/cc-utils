@@ -1,0 +1,9 @@
+#include "cc/astit.hpp"
+
+namespace cc::astit {
+
+std::string_view version() noexcept {
+  return "0.1.0";
+}
+
+}  // namespace cc::astit

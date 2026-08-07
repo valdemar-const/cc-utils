@@ -1,0 +1,11 @@
+project(cc-astit VERSION 0.1.0 LANGUAGES CXX)
+
+cc_add_library(${PROJECT_NAME}
+  SOURCES
+    src/${PROJECT_NAME}.cpp
+  PUBLIC_INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  PUBLIC_HEADERS
+    include/cc/astit.hpp
+  # PUBLIC_DEPS  cc-other::cc-other   # wire cross-project links here
+)

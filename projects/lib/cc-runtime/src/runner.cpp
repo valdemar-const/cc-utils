@@ -71,6 +71,7 @@ auto runner::ensure_outputs(std::string_view node_id) -> std::expected<void, fai
     if (s->dir() != slot_dir::in) continue;
     auto src = g_.find_source(node_id, s->id());
     if (!src) {
+      if (!s->is_required()) continue;  // optional slot, no upstream — fine
       in_progress_.erase(key);
       return std::unexpected(failure{"unconnected input '" + std::string{s->id()} +
                                      "' on node " + key});

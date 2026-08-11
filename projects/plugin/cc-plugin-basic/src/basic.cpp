@@ -20,12 +20,14 @@
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/readable_pipe.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/process/v2/process.hpp>
 #include <boost/process/v2/shell.hpp>
 #include <boost/process/v2/stdio.hpp>
 #include <boost/system/error_code.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -148,6 +150,63 @@ class from_file_factory final : public node_factory {
 };
 
 // ---------------------------------------------------------------------------
+// text.constant node — emits a literal string entered in the property editor
+// (multiline). Useful for args / inline source / hardcoded values without a
+// round-trip through a file on disk.
+// ---------------------------------------------------------------------------
+class constant_node final : public node {
+ public:
+  auto type_id()     const -> std::string_view override { return "basic.text.constant"; }
+  auto instance_id() const -> std::string_view override { return id_; }
+
+  auto slots() const -> std::span<slot const* const> override {
+    static const text_out_slot s_out{};
+    static constexpr slot const* arr[] = {&s_out};
+    return arr;
+  }
+
+  auto properties() -> node_properties& override { return props_; }
+
+  auto activate(std::span<const input_pair>,
+                std::span<output_pair> outputs) -> activate_result override {
+    std::string value{props_.get("value")};
+    for (auto& [slot_id, out] : outputs) {
+      if (slot_id == "out") {
+        *out = std::move(value);
+        return {};
+      }
+    }
+    return std::unexpected(failure{"no 'out' slot on " + id_});
+  }
+
+ private:
+  std::string id_{fresh_instance_id("basic.text.constant")};
+  props       props_;
+};
+
+class constant_factory final : public node_factory {
+ public:
+  auto type_id()      const -> std::string_view override { return "basic.text.constant"; }
+  auto display_name() const -> std::string_view override { return "Text Constant"; }
+  auto category()     const -> std::string_view override { return "Basic"; }
+
+  auto property_schema() const -> std::span<const property_desc> override {
+    static constexpr property_desc schema[] = {
+      {"value", "Value", property_kind::multiline, ""},
+    };
+    return schema;
+  }
+
+  auto create() const -> std::unique_ptr<node> override {
+    auto n = std::make_unique<constant_node>();
+    for (auto const& d : property_schema()) {
+      n->properties().set(d.key, d.default_value);
+    }
+    return n;
+  }
+};
+
+// ---------------------------------------------------------------------------
 // view node — debug tap, accepts any type.
 // ---------------------------------------------------------------------------
 class view_node final : public node {
@@ -224,6 +283,8 @@ class text_in_args_slot final : public slot {
   auto type() const -> type_descriptor_t override { return descriptor_of<std::string>; }
   auto dir()  const -> slot_dir          override { return slot_dir::in; }
   auto card() const -> slot_card         override { return slot_card::single; }
+  // Optional — exec without args is legitimate (the process just runs plainly).
+  auto is_required() const -> bool       override { return false; }
 };
 
 class long_out_slot final : public slot {
@@ -306,8 +367,10 @@ class exec_node final : public node {
 
     // v2 in boost 1.90 uses a single process_stdio initializer with three
     // fields (in/out/err). For merge_stderr we route both out and err to
-    // the same readable_pipe.
+    // the same readable_pipe. stdin is bound to the null device so the child
+    // never blocks waiting on the host's stdin.
     proc::process_stdio stdio;
+    stdio.in  = nullptr;  // /dev/null (POSIX) or NUL (Windows)
     stdio.out = out_pipe;
     if (merge) {
       stdio.err = out_pipe;
@@ -319,6 +382,26 @@ class exec_node final : public node {
     if (ec) {
       return std::unexpected(failure{"spawn failed: " + ec.message()});
     }
+
+    // Watchdog: if the child hasn't exited within the timeout, terminate it
+    // so the host UI doesn't block forever on a process waiting for stdin or
+    // running an infinite loop. Default 10 s, configurable via property.
+    auto timeout_sec = std::chrono::seconds{10};
+    {
+      std::string raw{props_.get("timeout_sec")};
+      if (!raw.empty()) {
+        try { timeout_sec = std::chrono::seconds{std::stol(raw)}; }
+        catch (...) { /* keep default */ }
+      }
+    }
+    asio::steady_timer watchdog(ctx, timeout_sec);
+    bool timed_out = false;
+    watchdog.async_wait([&](boost::system::error_code te) {
+      if (te) return;  // cancelled
+      timed_out = true;
+      boost::system::error_code kill_ec;
+      child.terminate(kill_ec);
+    });
 
     // Drain both pipes asynchronously. ctx.run() returns when both hit EOF
     // (child exited, write ends closed).
@@ -343,9 +426,17 @@ class exec_node final : public node {
 
     read_out();
     if (!merge) read_err();
-    ctx.run();
-    child.wait();
+    ctx.run();  // returns when pipes EOF (child closed its outputs)
+    watchdog.cancel();
+    boost::system::error_code wait_ec;
+    child.wait(wait_ec);  // reap exit status (already terminated either way)
     long code = child.exit_code();
+
+    if (timed_out) {
+      return std::unexpected(failure{"exec timed out after " +
+                                    std::to_string(timeout_sec.count()) +
+                                    "s (child terminated)"});
+    }
 
     for (auto& [slot_id, out] : outputs) {
       if (slot_id == "ret_code") *out = code;
@@ -369,6 +460,7 @@ class exec_factory final : public node_factory {
   auto property_schema() const -> std::span<const property_desc> override {
     static constexpr property_desc schema[] = {
       {"merge_stderr", "Merge stderr into stdout (2>&1)", property_kind::boolean, "false"},
+      {"timeout_sec",  "Timeout (seconds, 0 = no limit)", property_kind::integer, "10"},
     };
     return schema;
   }
@@ -399,6 +491,7 @@ extern "C" void cc_plugin_register(cc::host_registry& r) {
   r.types().register_value_type<std::filesystem::path>("path");
   r.types().register_value_type<long>("int");
   r.register_node_factory(std::make_unique<cc::basic::from_file_factory>());
+  r.register_node_factory(std::make_unique<cc::basic::constant_factory>());
   r.register_node_factory(std::make_unique<cc::basic::view_factory>());
   r.register_node_factory(std::make_unique<cc::basic::exec_factory>());
 }

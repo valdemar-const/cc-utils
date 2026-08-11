@@ -24,6 +24,12 @@ class CC_CORE_API slot {
   virtual auto type() const -> type_descriptor_t  = 0;
   virtual auto dir()  const -> slot_dir           = 0;
   virtual auto card() const -> slot_card          = 0;
+
+  // If false, the runner treats this input as optional: an unconnected slot
+  // is not an error — the activate() call simply receives no pair for it.
+  // Default is true (required). Override to return false in slots like
+  // basic.exec.args where empty/unconnected is a legitimate "no args" case.
+  virtual auto is_required() const -> bool        { return true; }
 };
 
 // Diagnostic returned on activation failure. Carries a human-readable message

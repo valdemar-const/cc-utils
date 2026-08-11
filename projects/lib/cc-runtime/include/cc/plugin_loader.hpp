@@ -3,6 +3,7 @@
 #include "cc-runtime_export.hpp"
 #include "cc/host.hpp"
 
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -24,19 +25,19 @@ class CC_RUNTIME_API plugin_loader
     plugin_loader(const plugin_loader &)            = delete;
     plugin_loader &operator=(const plugin_loader &) = delete;
 
-    // Default search dirs (in priority order):
-    //   1. $CCP_PLUGIN_PATH (colon-separated)
-    //   2. directory of the running executable
-    //   3. <exe dir>/../lib
+    // Default plugin search dirs (in priority order):
+    //   1. $CCP_PLUGIN_PATH (';' on Windows, ':' elsewhere)
+    //   2. <exe dir>/plugins        (installed layout)
+    //   3. <exe dir>/../plugins     (build-tree layout)
     //   4. "."
-    static auto default_search_dirs() -> std::vector<std::string>;
+    static auto default_search_dirs() -> std::vector<std::filesystem::path>;
 
     // Open `cc-plugin-<name>.so` from any search dir, version-check, register.
     // Returns empty string on success; error description on failure.
     auto load(std::string_view name, host_registry &host) -> std::string;
 
     // Open a specific .so path. Used by load() and load_all().
-    auto load_path(const std::string &path, host_registry &host) -> std::string;
+    auto load_path(const std::filesystem::path &path, host_registry &host) -> std::string;
 
     // Scan search dirs for `cc-plugin-*.so` and load all. Files that fail the
     // api_version check (or are otherwise malformed) are skipped with a stderr

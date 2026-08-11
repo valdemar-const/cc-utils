@@ -53,32 +53,42 @@ using ax::Widgets::Icon;
 namespace
 {
 
-#ifdef __linux__
-#include <unistd.h>
+#if defined(__linux__)
+#  include <unistd.h> // readlink
+#elif defined(_WIN32)
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h> // GetModuleFileNameA
+#endif
 
-std::string
+// Directory containing the running executable, as a real filesystem path
+// (resolves via /proc/self/exe on Linux, GetModuleFileNameA on Windows) so the
+// assets/ dir and similar siblings are found regardless of the CWD. Falls back
+// to "." on platforms without a known lookup.
+std::filesystem::path
 exe_dir()
 {
+#if defined(__linux__)
     char    buf[4096];
     ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf));
     if (n > 0)
     {
-        std::string p(buf, static_cast<size_t>(n));
-        auto        slash = p.find_last_of('/');
-        if (slash != std::string::npos)
-        {
-            return p.substr(0, slash);
-        }
+        return std::filesystem::path{std::string(buf, static_cast<size_t>(n))}.parent_path();
     }
-    return ".";
-}
-#else
-std::string
-exe_dir()
-{
-    return ".";
-}
+#elif defined(_WIN32)
+    char  buf[MAX_PATH];
+    DWORD n = ::GetModuleFileNameA(nullptr, buf, static_cast<DWORD>(sizeof(buf)));
+    if (n > 0 && n < sizeof(buf))
+    {
+        return std::filesystem::path{std::string(buf, static_cast<size_t>(n))}.parent_path();
+    }
 #endif
+    return std::filesystem::path{"."};
+}
 
 // ---------------------------------------------------------------------------
 // Colour palettes
@@ -266,10 +276,16 @@ struct AppState
     std::string                           view_cached_type_name;
     bool                                  view_cache_stale = true; // invalidation flag
     std::chrono::steady_clock::time_point view_stale_since = {};   // for debounce
+    // Monotonic counter bumped on every invalidation. A pull captures the value
+    // at start; on completion it only clears `view_cache_stale` if the counter
+    // is unchanged — otherwise an edit landed during the (slow, ~1s exec) pull
+    // and must trigger a fresh pull rather than being clobbered.
+    unsigned                              view_invalidate_gen = 0;
     // Background pull state.
     std::future<std::pair<std::string, std::optional<cc::any_value>>> view_pull_future;
     std::string                                                       view_pull_target; // node being pulled
     bool                                                              view_pull_running = false;
+    unsigned                                                          view_pull_started_gen = 0;
 
     // Fonts
     ImFont *ui_font   = nullptr;
@@ -373,6 +389,7 @@ invalidate_view_cache()
 {
     g_state.view_cache_stale = true;
     g_state.view_stale_since = std::chrono::steady_clock::now();
+    ++g_state.view_invalidate_gen;
     g_state.pipeline_dirty   = true;
 }
 
@@ -768,7 +785,7 @@ draw_property_widget(cc::node &n, const cc::property_desc &desc)
             {
                 g_state.file_dialog_target.instance = std::string {n.instance_id()};
                 g_state.file_dialog_target.key      = std::string {desc.key};
-                ifd::FileDialog::Instance().Open("node_path", "Open File", ".*", false, exe_dir() + "/assets");
+                ifd::FileDialog::Instance().Open("node_path", "Open File", ".*", false, (exe_dir() / "assets").string());
             }
             break;
         }
@@ -2025,11 +2042,20 @@ draw_view_window()
         g_state.view_selected = views[current_idx].instance;
         // Pure UI selection — invalidate cache so the new target gets pulled next
         // frame, but don't bump pipeline_dirty: nothing on disk has changed.
-        g_state.view_cache_stale = true;
-        g_state.view_stale_since = std::chrono::steady_clock::now();
+        g_state.view_cache_stale   = true;
+        g_state.view_stale_since   = std::chrono::steady_clock::now();
+        ++g_state.view_invalidate_gen;
     }
 
     ImGui::SameLine();
+    if (ImGui::SmallButton("Refresh"))
+    {
+        // basic.text.from_file reads its file fresh on every pull, but the view
+        // cache only invalidates on graph edits — so editing the .tl source on
+        // disk would otherwise keep showing the stale ret_code. This forces a
+        // re-pull of the selected view.
+        invalidate_view_cache();
+    }
 
     // Trigger a background pull when the cache has been stale longer than the
     // debounce window.
@@ -2037,6 +2063,7 @@ draw_view_window()
     {
         g_state.view_pull_target  = g_state.view_selected;
         g_state.view_pull_running = true;
+        g_state.view_pull_started_gen = g_state.view_invalidate_gen; // detect edits during pull
         g_state.view_cached_error.clear();
         std::string target       = g_state.view_selected;
         g_state.view_pull_future = std::async(
@@ -2085,7 +2112,13 @@ draw_view_window()
             auto [error_or_type, value_opt] = g_state.view_pull_future.get();
             g_state.view_pull_running       = false;
             g_state.view_cached_for         = g_state.view_pull_target;
-            g_state.view_cache_stale        = false;
+            // Only mark fresh if no edit invalidated the cache while this (slow)
+            // pull was running. If one did, leave stale so the next frame re-pulls
+            // with the new graph — otherwise the edit's result is lost.
+            if (g_state.view_pull_started_gen == g_state.view_invalidate_gen)
+            {
+                g_state.view_cache_stale = false;
+            }
             if (!error_or_type.empty())
             {
                 g_state.view_cached_error = std::move(error_or_type);

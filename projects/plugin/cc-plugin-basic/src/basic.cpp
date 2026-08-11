@@ -196,6 +196,9 @@ namespace
             {
                 path = std::filesystem::path {ctx.pipeline_dir} / path;
             }
+            // Collapse redundant "."/".." left by the lexical join above (e.g.
+            // a property of "./source.txt" would otherwise read as …\dir\.\source.txt).
+            path = path.lexically_normal();
             log("from_file[" + id_ + "]: opening " + path.string());
             std::ifstream in(path);
             if (!in)

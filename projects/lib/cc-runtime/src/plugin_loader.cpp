@@ -44,7 +44,7 @@ namespace
         return f;
     }
 
-    std::string
+    std::filesystem::path
     exe_dir()
     {
 #if defined(__linux__)
@@ -52,38 +52,28 @@ namespace
         ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf));
         if (n > 0)
         {
-            std::string p(buf, static_cast<size_t>(n));
-            auto        slash = p.find_last_of('/');
-            if (slash != std::string::npos)
-            {
-                return p.substr(0, slash);
-            }
+            return std::filesystem::path{std::string(buf, static_cast<size_t>(n))}.parent_path();
         }
 #elif defined(_WIN32)
         char  buf[MAX_PATH];
         DWORD n = ::GetModuleFileNameA(nullptr, buf, static_cast<DWORD>(sizeof(buf)));
         if (n > 0 && n < sizeof(buf))
         {
-            std::string p(buf, static_cast<size_t>(n));
-            auto        slash = p.find_last_of("\\/");
-            if (slash != std::string::npos)
-            {
-                return p.substr(0, slash);
-            }
+            return std::filesystem::path{std::string(buf, static_cast<size_t>(n))}.parent_path();
         }
 #endif
-        return ".";
+        return std::filesystem::path{"."};
     }
 
     auto
-    search_dirs() -> std::vector<std::string>
+    search_dirs() -> std::vector<std::filesystem::path>
     {
 #if defined(_WIN32)
         constexpr char sep = ';'; // PATH-style on Windows — ':' would slice "C:\"
 #else
         constexpr char sep = ':';
 #endif
-        std::vector<std::string> dirs;
+        std::vector<std::filesystem::path> dirs;
         if (const char *env = std::getenv("CCP_PLUGIN_PATH"); env && *env)
         {
             std::string s {env};
@@ -104,10 +94,10 @@ namespace
         // executable. Two layouts are covered: installed (plugins/ is a
         // subdirectory of exe_dir, beside the binary) and the cc-utils build
         // tree (plugins/ is a sibling of bin/, i.e. one level up from exe_dir).
-        std::string ed = exe_dir();
-        dirs.push_back(ed + "/plugins");
-        dirs.push_back(ed + "/../plugins");
-        dirs.push_back(".");
+        std::filesystem::path ed = exe_dir();
+        dirs.push_back(ed / "plugins");
+        dirs.push_back(ed / ".." / "plugins");
+        dirs.emplace_back(".");
         return dirs;
     }
 
@@ -126,20 +116,20 @@ plugin_loader::plugin_loader()
 plugin_loader::~plugin_loader() = default;
 
 auto
-plugin_loader::default_search_dirs() -> std::vector<std::string>
+plugin_loader::default_search_dirs() -> std::vector<std::filesystem::path>
 {
     return search_dirs();
 }
 
 auto
-plugin_loader::load_path(const std::string &path, host_registry &host) -> std::string
+plugin_loader::load_path(const std::filesystem::path &path, host_registry &host) -> std::string
 {
     auto                      lib = std::make_unique<dll::shared_library>();
     boost::system::error_code ec;
-    lib->load(path, ec);
+    lib->load(path.string(), ec);
     if (!lib->is_loaded())
     {
-        return "failed to load '" + path + "': " + ec.message();
+        return "failed to load '" + path.string() + "': " + ec.message();
     }
 
     // cc_plugin_load — version check.
@@ -147,7 +137,7 @@ plugin_loader::load_path(const std::string &path, host_registry &host) -> std::s
     auto info    = info_fn();
     if (info.api_version != cc::plugin_api_version)
     {
-        return std::string {path} + ": api " + std::to_string(info.api_version) + " != host " + std::to_string(cc::plugin_api_version) + " (rebuild plugin)";
+        return path.string() + ": api " + std::to_string(info.api_version) + " != host " + std::to_string(cc::plugin_api_version) + " (rebuild plugin)";
     }
 
     // cc_plugin_register — populate the host.
@@ -179,7 +169,7 @@ plugin_loader::load(std::string_view name, host_registry &host) -> std::string
     std::string fname = plugin_filename(name);
     for (const auto &d : search_dirs())
     {
-        std::string full = d + "/" + fname;
+        std::filesystem::path full = d / fname;
         if (!std::filesystem::exists(full))
         {
             continue;
@@ -219,7 +209,7 @@ plugin_loader::load_all(host_registry &host) -> std::size_t
                 continue;
             }
 
-            std::string err = load_path(path.string(), host);
+            std::string err = load_path(path, host);
             if (!err.empty())
             {
                 std::fprintf(stderr, "cc-runtime: skip %s: %s\n", path.string().c_str(), err.c_str());

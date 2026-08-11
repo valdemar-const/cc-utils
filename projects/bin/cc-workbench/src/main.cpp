@@ -419,6 +419,75 @@ class ast_view_renderer final : public cc::view_renderer {
 };
 
 // ---------------------------------------------------------------------------
+// int view renderer — shows a long value (typically exec's ret_code) as a
+// readable "Exit code: N (0xHEX)" line + signed/unsigned interpretation.
+// ---------------------------------------------------------------------------
+class int_view_renderer final : public cc::view_renderer {
+ public:
+  auto type_name() const -> std::string_view override { return "int"; }
+
+  auto render(const cc::any_value& value, cc::view_context&) -> void override {
+    const auto* p = aa::any_cast<long>(&value);
+    if (!p) {
+      ImGui::TextDisabled("view: value is not int (long)");
+      return;
+    }
+    long v = *p;
+    unsigned long uv = static_cast<unsigned long>(v);
+
+    ImGui::PushFont(g_state.mono_font);
+    ImGui::TextDisabled("Exit code");
+    ImGui::SameLine();
+    if (v == 0) {
+      ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.40f, 0.85f, 0.45f, 1.0f));
+      ImGui::Text("%ld  (0x%lX)  ✓ success", v, uv);
+    } else {
+      ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.55f, 0.40f, 1.0f));
+      ImGui::Text("%ld  (0x%lX)  ✗ failure", v, uv);
+    }
+    ImGui::PopStyleColor();
+    ImGui::PopFont();
+  }
+};
+
+// ---------------------------------------------------------------------------
+// path view renderer — shows a filesystem path with a Copy button so the
+// user can paste it elsewhere.
+// ---------------------------------------------------------------------------
+class path_view_renderer final : public cc::view_renderer {
+ public:
+  auto type_name() const -> std::string_view override { return "path"; }
+
+  auto render(const cc::any_value& value, cc::view_context&) -> void override {
+    const auto* p = aa::any_cast<std::filesystem::path>(&value);
+    if (!p) {
+      ImGui::TextDisabled("view: value is not a path");
+      return;
+    }
+    const std::string s = p->string();
+    ImGui::PushFont(g_state.mono_font);
+    ImGui::TextDisabled("Path");
+    ImGui::SameLine();
+    ImGui::TextUnformatted(s.c_str());
+    ImGui::PopFont();
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Copy")) {
+      ImGui::SetClipboardText(s.c_str());
+    }
+    ImGui::SameLine();
+    if (std::filesystem::exists(*p)) {
+      ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.40f, 0.85f, 0.45f, 1.0f));
+      ImGui::TextDisabled("(exists)");
+      ImGui::PopStyleColor();
+    } else {
+      ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.55f, 0.40f, 1.0f));
+      ImGui::TextDisabled("(missing)");
+      ImGui::PopStyleColor();
+    }
+  }
+};
+
+// ---------------------------------------------------------------------------
 // File-dialog poll
 // ---------------------------------------------------------------------------
 void poll_file_dialog() {
@@ -1173,6 +1242,8 @@ int main() {
   g_state.host->renderers().register_renderer(std::make_unique<text_view_renderer>());
   g_state.host->renderers().register_renderer(std::make_unique<ir_view_renderer>());
   g_state.host->renderers().register_renderer(std::make_unique<ast_view_renderer>());
+  g_state.host->renderers().register_renderer(std::make_unique<int_view_renderer>());
+  g_state.host->renderers().register_renderer(std::make_unique<path_view_renderer>());
 
   std::size_t loaded = g_state.loader.load_all(*g_state.host);
   g_state.loaded_plugins = loaded;

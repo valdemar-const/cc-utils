@@ -17,20 +17,12 @@
 #include "cc/node_factory.hpp"
 #include "cc/plugin_entry.hpp"
 
-#include <boost/asio/buffer.hpp>
-#include <boost/asio/io_context.hpp>
-#include <boost/asio/readable_pipe.hpp>
-#include <boost/asio/steady_timer.hpp>
-#include <boost/process/v2/process.hpp>
-#include <boost/process/v2/shell.hpp>
-#include <boost/process/v2/stdio.hpp>
-#include <boost/system/error_code.hpp>
-
 #include <atomic>
-#include <chrono>
+#include <cctype>
+#include <cstdio>       // std::remove, popen/pclose
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <functional>
 #include <memory>
 #include <span>
 #include <sstream>
@@ -38,6 +30,16 @@
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <vector>
+
+#ifdef _WIN32
+#  include <process.h>  // _getpid
+#  define CC_GET_PID()  _getpid()
+#else
+#  include <unistd.h>   // getpid, WIFEXITED/WEXITSTATUS via sys/wait.h
+#  include <sys/wait.h>
+#  define CC_GET_PID()  ::getpid()
+#endif
 
 namespace cc::basic {
 
@@ -263,17 +265,16 @@ class view_factory final : public node_factory {
 // ---------------------------------------------------------------------------
 // exec node — runs an executable, exposes ret_code / cout / cerr as wires.
 //
-//   inputs:  exe (path), args (text)
+//   inputs:  exe (path), args (text, optional)
 //   outputs: ret_code (long), cout (text), cerr (text)
 //   property: merge_stderr (bool, default false) — analogous to `2>&1`
 //
-// Cross-platform via boost::process v2: spawn + std_out/std_err > pipes, drive
-// async reads on an io_context, wait for exit, harvest exit code. On POSIX
-// the default launcher forks+execs; on Windows it uses CreateProcess.
+// Implementation uses popen()/pclose() with a temp file for stderr — simple,
+// sync, deadlock-free, and cross-platform (POSIX popen / Windows _popen).
+// We deliberately avoid boost::process v2 here because its asio pipe loop
+// hangs on Linux when the child is a small static binary that exits quickly
+// (pipe EOF race in v2's process_stdio pipe teardown).
 // ---------------------------------------------------------------------------
-namespace proc = boost::process::v2;
-namespace asio = boost::asio;
-
 class path_in_exe_slot final : public slot {
  public:
   auto id()   const -> std::string_view  override { return "exe"; }
@@ -345,121 +346,98 @@ class exec_node final : public node {
       return std::unexpected(failure{"'exe' input not connected or empty"});
     }
 
-    // Build a shell command line: "<exe> <args>". proc::shell parses this
-    // cross-platform (POSIX word-split / Windows CommandLineToArgvW) and
-    // resolves the executable in PATH via proc::shell::exe().
+    // Build the shell command line. We run via "/bin/sh -c <cmd>" (POSIX) or
+    // "cmd.exe /c <cmd>" (Windows) implicitly through popen, so args can use
+    // shell quoting/globbing — convenient for a dev tool, not safe for
+    // untrusted input.
     std::string cmd = exe_p->string();
     if (args_s && !args_s->empty()) {
       cmd += " ";
       cmd += *args_s;
     }
-    log("exec[" + id_ + "]: cmd = \"" + cmd + "\"");
-    proc::shell sh(cmd);
-    if (sh.empty()) {
-      log("exec[" + id_ + "]: shell parse empty");
-      return std::unexpected(failure{"empty command line"});
-    }
-    auto exe_resolved = sh.exe();
-    if (exe_resolved.empty()) {
-      exe_resolved = *exe_p;  // fall back to literal path
-    }
-    log("exec[" + id_ + "]: resolved exe = " + exe_resolved.string());
 
     const bool merge = props_.get("merge_stderr") == "true"
                        || props_.get("merge_stderr") == "1";
 
-    boost::system::error_code ec;
-    asio::io_context ctx;
-    asio::readable_pipe out_pipe(ctx);
-    asio::readable_pipe err_pipe(ctx);
-
-    // v2 in boost 1.90 uses a single process_stdio initializer with three
-    // fields (in/out/err). For merge_stderr we route both out and err to
-    // the same readable_pipe. stdin is bound to the null device so the child
-    // never blocks waiting on the host's stdin.
-    proc::process_stdio stdio;
-    stdio.in  = nullptr;  // /dev/null (POSIX) or NUL (Windows)
-    stdio.out = out_pipe;
+    // Optionally redirect stderr to a temp file so we can capture both
+    // streams independently. popen only gives us stdout.
+    std::filesystem::path err_tmp;
     if (merge) {
-      stdio.err = out_pipe;
+      cmd += " 2>&1";
     } else {
-      stdio.err = err_pipe;
-    }
-
-    proc::process child(ctx, exe_resolved, sh.args(), stdio, ec);
-    if (ec) {
-      log("exec[" + id_ + "]: spawn FAILED: " + ec.message());
-      return std::unexpected(failure{"spawn failed: " + ec.message()});
-    }
-    log("exec[" + id_ + "]: spawned pid " + std::to_string(child.id()));
-
-    // Watchdog: if the child hasn't exited within the timeout, terminate it
-    // so the host UI doesn't block forever on a process waiting for stdin or
-    // running an infinite loop. Default 10 s, configurable via property.
-    auto timeout_sec = std::chrono::seconds{10};
-    {
-      std::string raw{props_.get("timeout_sec")};
-      if (!raw.empty()) {
-        try { timeout_sec = std::chrono::seconds{std::stol(raw)}; }
-        catch (...) { /* keep default */ }
+      // Build a safe temp filename from this node's instance id.
+      std::string safe_id;
+      safe_id.reserve(id_.size());
+      for (char c : id_) {
+        safe_id.push_back(std::isalnum(static_cast<unsigned char>(c)) ? c : '_');
       }
-    }
-    asio::steady_timer watchdog(ctx, timeout_sec);
-    bool timed_out = false;
-    watchdog.async_wait([&](boost::system::error_code te) {
-      if (te) return;  // cancelled
-      timed_out = true;
-      log("exec[" + id_ + "]: TIMEOUT — terminating child");
-      boost::system::error_code kill_ec;
-      child.terminate(kill_ec);
-    });
-
-    // Drain both pipes asynchronously. ctx.run() returns when both hit EOF
-    // (child exited, write ends closed).
-    std::string out, err;
-    char out_buf[4096], err_buf[4096];
-    std::function<void()> read_out, read_err;
-
-    read_out = [&]() {
-      out_pipe.async_read_some(asio::buffer(out_buf),
-        [&](boost::system::error_code r_ec, std::size_t n) {
-          if (n > 0) out.append(out_buf, n);
-          if (!r_ec) read_out();  // continue until EOF
-        });
-    };
-    read_err = [&]() {
-      err_pipe.async_read_some(asio::buffer(err_buf),
-        [&](boost::system::error_code r_ec, std::size_t n) {
-          if (n > 0) err.append(err_buf, n);
-          if (!r_ec) read_err();
-        });
-    };
-
-    log("exec[" + id_ + "]: ctx.run starting");
-    read_out();
-    if (!merge) read_err();
-    ctx.run();  // returns when pipes EOF (child closed its outputs)
-    log("exec[" + id_ + "]: ctx.run done");
-    watchdog.cancel();
-    boost::system::error_code wait_ec;
-    child.wait(wait_ec);  // reap exit status (already terminated either way)
-    long code = child.exit_code();
-    log("exec[" + id_ + "]: exit_code = " + std::to_string(code) +
-        ", cout=" + std::to_string(out.size()) + "B" +
-        ", cerr=" + std::to_string(err.size()) + "B");
-
-    if (timed_out) {
-      return std::unexpected(failure{"exec timed out after " +
-                                    std::to_string(timeout_sec.count()) +
-                                    "s (child terminated)"});
+      err_tmp = std::filesystem::temp_directory_path()
+              / ("cc_exec_" + std::to_string(CC_GET_PID()) + "_" + safe_id + ".err");
+      cmd += " 2>";
+      cmd += err_tmp.string();
     }
 
-    for (auto& [slot_id, out] : outputs) {
-      if (slot_id == "ret_code") *out = code;
-      else if (slot_id == "cout") *out = out;
-      else if (slot_id == "cerr") *out = err;
+    // stdin is `< /dev/null` (POSIX) / `< NUL` (Windows) so the child can
+    // never block waiting on host input.
+#ifdef _WIN32
+    cmd += " < NUL";
+#else
+    cmd += " < /dev/null";
+#endif
+
+    log("exec[" + id_ + "]: cmd = \"" + cmd + "\"");
+
+    std::string out;
+    {
+      FILE* p =
+#ifdef _WIN32
+        ::_popen(cmd.c_str(), "r");
+#else
+        ::popen(cmd.c_str(), "r");
+#endif
+      if (!p) {
+        if (!err_tmp.empty()) std::filesystem::remove(err_tmp);
+        return std::unexpected(failure{"popen failed for '" + cmd + "'"});
+      }
+      char buf[4096];
+      while (true) {
+        size_t n = ::fread(buf, 1, sizeof(buf), p);
+        if (n == 0) {
+          if (::feof(p)) break;
+          if (::ferror(p)) break;
+        }
+        out.append(buf, n);
+      }
+#ifdef _WIN32
+      int code = ::_pclose(p);
+#else
+      int status = ::pclose(p);
+      int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+      log("exec[" + id_ + "]: exit_code = " + std::to_string(code) +
+          ", cout=" + std::to_string(out.size()) + "B");
+
+      // Capture stderr from the temp file (if separate).
+      std::string err;
+      if (!err_tmp.empty()) {
+        std::ifstream ef(err_tmp);
+        if (ef) {
+          std::ostringstream ss; ss << ef.rdbuf();
+          err = ss.str();
+        }
+        std::filesystem::remove(err_tmp);
+      }
+      if (!err.empty()) {
+        log("exec[" + id_ + "]: cerr=" + std::to_string(err.size()) + "B");
+      }
+
+      for (auto& [slot_id, out_v] : outputs) {
+        if (slot_id == "ret_code") *out_v = static_cast<long>(code);
+        else if (slot_id == "cout") *out_v = out;
+        else if (slot_id == "cerr") *out_v = err;
+      }
+      return {};
     }
-    return {};
   }
 
  private:
@@ -476,7 +454,6 @@ class exec_factory final : public node_factory {
   auto property_schema() const -> std::span<const property_desc> override {
     static constexpr property_desc schema[] = {
       {"merge_stderr", "Merge stderr into stdout (2>&1)", property_kind::boolean, "false"},
-      {"timeout_sec",  "Timeout (seconds, 0 = no limit)", property_kind::integer, "10"},
     };
     return schema;
   }

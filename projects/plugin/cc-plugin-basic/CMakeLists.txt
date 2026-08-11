@@ -5,6 +5,4 @@ cc_add_plugin(${PROJECT_NAME}
     src/basic.cpp
   PUBLIC_DEPS
     cc-core::cc-core
-  PRIVATE_DEPS
-    Boost::process
 )

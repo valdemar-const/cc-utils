@@ -17,9 +17,17 @@
 #include "cc/node_factory.hpp"
 #include "cc/plugin_entry.hpp"
 
+#include <boost/asio/buffer.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/readable_pipe.hpp>
+#include <boost/process/v2/process.hpp>
+#include <boost/process/v2/stdio.hpp>
+#include <boost/system/error_code.hpp>
+
 #include <atomic>
 #include <cctype>
-#include <cstdio>       // std::remove, popen/pclose
+#include <chrono>
+#include <cstdio>       // std::remove
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -28,6 +36,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -36,7 +45,7 @@
 #  include <process.h>  // _getpid
 #  define CC_GET_PID()  _getpid()
 #else
-#  include <unistd.h>   // getpid, WIFEXITED/WEXITSTATUS via sys/wait.h
+#  include <unistd.h>   // getpid
 #  include <sys/wait.h>
 #  define CC_GET_PID()  ::getpid()
 #endif
@@ -346,98 +355,90 @@ class exec_node final : public node {
       return std::unexpected(failure{"'exe' input not connected or empty"});
     }
 
-    // Build the shell command line. We run via "/bin/sh -c <cmd>" (POSIX) or
-    // "cmd.exe /c <cmd>" (Windows) implicitly through popen, so args can use
-    // shell quoting/globbing — convenient for a dev tool, not safe for
-    // untrusted input.
-    std::string cmd = exe_p->string();
+    // Build argv directly from exe + whitespace-split args. We bypass
+    // /bin/sh intentionally: no shell quoting surprises, no shell startup
+    // overhead, no shell-injection surface. exe is run as-is, args is split
+    // by whitespace into separate argv entries.
+    std::vector<std::string> argv_stored;
+    argv_stored.push_back(exe_p->string());
     if (args_s && !args_s->empty()) {
-      cmd += " ";
-      cmd += *args_s;
+      std::istringstream iss(*args_s);
+      std::string tok;
+      while (iss >> tok) argv_stored.push_back(tok);
     }
+    std::vector<std::string_view> argv;
+    argv.reserve(argv_stored.size());
+    for (auto const& a : argv_stored) argv.push_back(a);
 
     const bool merge = props_.get("merge_stderr") == "true"
                        || props_.get("merge_stderr") == "1";
 
-    // Optionally redirect stderr to a temp file so we can capture both
-    // streams independently. popen only gives us stdout.
-    std::filesystem::path err_tmp;
-    if (merge) {
-      cmd += " 2>&1";
-    } else {
-      // Build a safe temp filename from this node's instance id.
-      std::string safe_id;
-      safe_id.reserve(id_.size());
-      for (char c : id_) {
-        safe_id.push_back(std::isalnum(static_cast<unsigned char>(c)) ? c : '_');
-      }
-      err_tmp = std::filesystem::temp_directory_path()
-              / ("cc_exec_" + std::to_string(CC_GET_PID()) + "_" + safe_id + ".err");
-      cmd += " 2>";
-      cmd += err_tmp.string();
+    log("exec[" + id_ + "]: spawn " + exe_p->string() +
+        " (argc=" + std::to_string(argv.size()) + ")");
+
+    namespace proc = boost::process::v2;
+    namespace asio = boost::asio;
+
+    asio::io_context ctx;
+    asio::readable_pipe out_pipe(ctx);
+    asio::readable_pipe err_pipe(ctx);
+
+    // v2 in boost 1.90: process_stdio{ in, out, err }. nullptr → /dev/null
+    // (POSIX) / NUL (Windows). Each output binding creates a pipe internally;
+    // the *child* end (write fd) lives inside the binding until the binding
+    // is destroyed. We MUST destroy stdio right after spawn so the parent's
+    // copy of the write end is closed — otherwise the readable_pipe never
+    // sees EOF and read_some blocks forever.
+    boost::system::error_code ec;
+    proc::process child = [&] {
+      proc::process_stdio s = [&] {
+        if (merge) return proc::process_stdio{ nullptr, out_pipe, out_pipe };
+        return     proc::process_stdio{ nullptr, out_pipe, err_pipe };
+      }();
+      return proc::default_process_launcher()(
+          ctx, ec, *exe_p, argv_stored, s);
+      // s destroyed here → child-end write fds closed in parent.
+    }();
+    if (ec) {
+      log("exec[" + id_ + "]: spawn FAILED: " + ec.message());
+      return std::unexpected(failure{"spawn failed: " + ec.message()});
     }
+    log("exec[" + id_ + "]: pid=" + std::to_string(child.id()));
 
-    // stdin is `< /dev/null` (POSIX) / `< NUL` (Windows) so the child can
-    // never block waiting on host input.
-#ifdef _WIN32
-    cmd += " < NUL";
-#else
-    cmd += " < /dev/null";
-#endif
-
-    log("exec[" + id_ + "]: cmd = \"" + cmd + "\"");
-
-    std::string out;
-    {
-      FILE* p =
-#ifdef _WIN32
-        ::_popen(cmd.c_str(), "r");
-#else
-        ::popen(cmd.c_str(), "r");
-#endif
-      if (!p) {
-        if (!err_tmp.empty()) std::filesystem::remove(err_tmp);
-        return std::unexpected(failure{"popen failed for '" + cmd + "'"});
-      }
+    // Drain each pipe in its own thread via blocking read_some. Concurrent
+    // reads are essential — a single-threaded loop that reads stdout-then-
+    // stderr would deadlock on a child that fills the stderr pipe while we
+    // wait on stdout. Each thread loops until EOF (child closed its end).
+    auto drain = [](asio::readable_pipe& pipe) {
+      std::string out;
       char buf[4096];
       while (true) {
-        size_t n = ::fread(buf, 1, sizeof(buf), p);
-        if (n == 0) {
-          if (::feof(p)) break;
-          if (::ferror(p)) break;
-        }
-        out.append(buf, n);
+        boost::system::error_code rec;
+        std::size_t n = pipe.read_some(asio::buffer(buf), rec);
+        if (n > 0) out.append(buf, n);
+        if (rec) break;  // eof or error
       }
-#ifdef _WIN32
-      int code = ::_pclose(p);
-#else
-      int status = ::pclose(p);
-      int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-#endif
-      log("exec[" + id_ + "]: exit_code = " + std::to_string(code) +
-          ", cout=" + std::to_string(out.size()) + "B");
+      return out;
+    };
 
-      // Capture stderr from the temp file (if separate).
-      std::string err;
-      if (!err_tmp.empty()) {
-        std::ifstream ef(err_tmp);
-        if (ef) {
-          std::ostringstream ss; ss << ef.rdbuf();
-          err = ss.str();
-        }
-        std::filesystem::remove(err_tmp);
-      }
-      if (!err.empty()) {
-        log("exec[" + id_ + "]: cerr=" + std::to_string(err.size()) + "B");
-      }
+    std::string out, err;
+    std::thread out_t([&] { out = drain(out_pipe); });
+    std::thread err_t([&] { err = merge ? std::string{} : drain(err_pipe); });
+    out_t.join();
+    err_t.join();
 
-      for (auto& [slot_id, out_v] : outputs) {
-        if (slot_id == "ret_code") *out_v = static_cast<long>(code);
-        else if (slot_id == "cout") *out_v = out;
-        else if (slot_id == "cerr") *out_v = err;
-      }
-      return {};
+    child.wait();
+    long code = child.exit_code();
+    log("exec[" + id_ + "]: exit_code = " + std::to_string(code) +
+        ", cout=" + std::to_string(out.size()) + "B" +
+        ", cerr=" + std::to_string(err.size()) + "B");
+
+    for (auto& [slot_id, out_v] : outputs) {
+      if (slot_id == "ret_code") *out_v = code;
+      else if (slot_id == "cout") *out_v = out;
+      else if (slot_id == "cerr") *out_v = err;
     }
+    return {};
   }
 
  private:

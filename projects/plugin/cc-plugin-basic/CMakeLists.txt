@@ -5,4 +5,11 @@ cc_add_plugin(${PROJECT_NAME}
     src/basic.cpp
   PUBLIC_DEPS
     cc-core::cc-core
+  PRIVATE_DEPS
+    Boost::process
+    Boost::system
 )
+# boost::process v2 defaults to boost::filesystem; we use std::filesystem
+# everywhere else, so make v2 follow suit to avoid path-type mismatches at
+# the spawn call site.
+target_compile_definitions(${PROJECT_NAME} PRIVATE BOOST_PROCESS_USE_STD_FS)

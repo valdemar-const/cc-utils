@@ -35,6 +35,7 @@
 #include <filesystem>
 #include <functional>
 #include <future>
+#include <mutex>
 #include <optional>
 #include <thread>
 #include <map>
@@ -199,36 +200,43 @@ class log_view final {
     editor_.SetPalette(TextEditor::GetDarkPalette());
     editor_.SetReadOnlyEnabled(true);
   }
+  // Thread-safe append — activate() runs on a worker thread (async pull).
   void append(std::string_view line) {
+    std::lock_guard lock(mutex_);
     buffer_.append(line);
     buffer_.append("\n");
     dirty_ = true;
   }
+  // Render is called only from the UI thread.
   void render() {
-    if (dirty_) {
-      // SetText resets scroll. If user was near the bottom, stick to bottom
-      // (usual terminal behaviour); otherwise restore the first visible line.
-      size_t first  = editor_.GetFirstVisibleRow();
-      size_t total  = editor_.GetLineCount();
-      bool   at_end = (first + 3 >= total) || (total < 5);
+    {
+      std::lock_guard lock(mutex_);
+      if (dirty_) {
+        // SetText resets scroll. If user was near the bottom, stick to bottom
+        // (usual terminal behaviour); otherwise restore the first visible line.
+        size_t first  = editor_.GetFirstVisibleRow();
+        size_t total  = editor_.GetLineCount();
+        bool   at_end = (first + 3 >= total) || (total < 5);
 
-      editor_.SetText(buffer_);
-      size_t new_total = editor_.GetLineCount();
-      if (at_end && new_total > 0) {
-        editor_.ScrollToLine(new_total, TextEditor::Scroll::alignBottom);
-      } else if (first < new_total) {
-        editor_.ScrollToLine(first, TextEditor::Scroll::alignTop);
+        editor_.SetText(buffer_);
+        size_t new_total = editor_.GetLineCount();
+        if (at_end && new_total > 0) {
+          editor_.ScrollToLine(new_total, TextEditor::Scroll::alignBottom);
+        } else if (first < new_total) {
+          editor_.ScrollToLine(first, TextEditor::Scroll::alignTop);
+        }
+        dirty_ = false;
       }
-      dirty_ = false;
     }
     if (g_state.mono_font) ImGui::PushFont(g_state.mono_font);
     editor_.Render("##log_text", ImVec2(0, 0), false);
     if (g_state.mono_font) ImGui::PopFont();
   }
  private:
-  TextEditor  editor_;
-  std::string buffer_;
-  bool        dirty_ = false;
+  TextEditor    editor_;
+  std::string   buffer_;
+  bool          dirty_ = false;
+  std::mutex    mutex_;
 };
 
 AppState g_state;
@@ -707,7 +715,9 @@ void run_pipeline() {
   }
 
   log("run: pulling output 'exe' of " + target + " ...");
-  cc::runtime::runner r{g_state.g};
+  cc::runtime::runner r{g_state.g, [](std::string_view msg) {
+    ::log(std::string{msg});
+  }};
   auto result = r.pull(target, "exe");
   if (!result) {
     log("run failed: " + result.error().what);
@@ -1026,7 +1036,9 @@ void draw_view_window() {
     g_state.view_pull_future = std::async(
         std::launch::async,
         [target]() -> std::pair<std::string, std::optional<cc::any_value>> {
-          cc::runtime::runner r{g_state.g};
+          cc::runtime::runner r{g_state.g, [](std::string_view msg) {
+            ::log(std::string{msg});
+          }};
           auto result = r.pull(target, "in");
           if (!result) {
             return {result.error().what, std::nullopt};

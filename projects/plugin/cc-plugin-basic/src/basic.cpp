@@ -106,16 +106,20 @@ class from_file_node final : public node {
       return std::unexpected(failure{"'path' not set"});
     }
     std::filesystem::path path(raw);
+    log("from_file[" + id_ + "]: opening " + path.string());
     std::ifstream in(path);
     if (!in) {
+      log("from_file[" + id_ + "]: cannot open");
       return std::unexpected(failure{"cannot open '" + path.string() + "'"});
     }
     std::ostringstream ss;
     ss << in.rdbuf();
+    auto content = ss.str();
+    log("from_file[" + id_ + "]: read " + std::to_string(content.size()) + " bytes");
 
     for (auto& [slot_id, out] : outputs) {
       if (slot_id == "out") {
-        *out = ss.str();
+        *out = std::move(content);
         return {};
       }
     }
@@ -170,6 +174,7 @@ class constant_node final : public node {
   auto activate(std::span<const input_pair>,
                 std::span<output_pair> outputs) -> activate_result override {
     std::string value{props_.get("value")};
+    log("text.constant[" + id_ + "]: emitting " + std::to_string(value.size()) + " bytes");
     for (auto& [slot_id, out] : outputs) {
       if (slot_id == "out") {
         *out = std::move(value);
@@ -348,14 +353,17 @@ class exec_node final : public node {
       cmd += " ";
       cmd += *args_s;
     }
+    log("exec[" + id_ + "]: cmd = \"" + cmd + "\"");
     proc::shell sh(cmd);
     if (sh.empty()) {
+      log("exec[" + id_ + "]: shell parse empty");
       return std::unexpected(failure{"empty command line"});
     }
     auto exe_resolved = sh.exe();
     if (exe_resolved.empty()) {
       exe_resolved = *exe_p;  // fall back to literal path
     }
+    log("exec[" + id_ + "]: resolved exe = " + exe_resolved.string());
 
     const bool merge = props_.get("merge_stderr") == "true"
                        || props_.get("merge_stderr") == "1";
@@ -380,8 +388,10 @@ class exec_node final : public node {
 
     proc::process child(ctx, exe_resolved, sh.args(), stdio, ec);
     if (ec) {
+      log("exec[" + id_ + "]: spawn FAILED: " + ec.message());
       return std::unexpected(failure{"spawn failed: " + ec.message()});
     }
+    log("exec[" + id_ + "]: spawned pid " + std::to_string(child.id()));
 
     // Watchdog: if the child hasn't exited within the timeout, terminate it
     // so the host UI doesn't block forever on a process waiting for stdin or
@@ -399,6 +409,7 @@ class exec_node final : public node {
     watchdog.async_wait([&](boost::system::error_code te) {
       if (te) return;  // cancelled
       timed_out = true;
+      log("exec[" + id_ + "]: TIMEOUT — terminating child");
       boost::system::error_code kill_ec;
       child.terminate(kill_ec);
     });
@@ -424,13 +435,18 @@ class exec_node final : public node {
         });
     };
 
+    log("exec[" + id_ + "]: ctx.run starting");
     read_out();
     if (!merge) read_err();
     ctx.run();  // returns when pipes EOF (child closed its outputs)
+    log("exec[" + id_ + "]: ctx.run done");
     watchdog.cancel();
     boost::system::error_code wait_ec;
     child.wait(wait_ec);  // reap exit status (already terminated either way)
     long code = child.exit_code();
+    log("exec[" + id_ + "]: exit_code = " + std::to_string(code) +
+        ", cout=" + std::to_string(out.size()) + "B" +
+        ", cerr=" + std::to_string(err.size()) + "B");
 
     if (timed_out) {
       return std::unexpected(failure{"exec timed out after " +

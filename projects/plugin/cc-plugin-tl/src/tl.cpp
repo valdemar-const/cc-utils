@@ -104,14 +104,17 @@ class frontend_node final : public node {
     if (src_text == nullptr) {
       return std::unexpected(failure{"'src' input not connected or wrong type"});
     }
+    log("tl.frontend[" + id_ + "]: parsing " + std::to_string(src_text->size()) + " chars");
 
     auto parsed = cc::parseit::parse(*src_text);
     if (!parsed) {
+      log("tl.frontend[" + id_ + "]: parse error: " + std::move(parsed).error());
       return std::unexpected(failure{"parse error: " + std::move(parsed).error()});
     }
 
     auto carrier = std::make_shared<cc::ast::tl_program>();
     carrier->root = std::make_unique<cc::ast::program>(std::move(*parsed));
+    log("tl.frontend[" + id_ + "]: AST ok");
 
     for (auto& [slot_id, out] : outputs) {
       if (slot_id == "ast") {

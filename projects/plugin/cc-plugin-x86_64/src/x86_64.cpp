@@ -119,9 +119,11 @@ class nasm_gen_node final : public node {
     if (mod == nullptr) {
       return std::unexpected(failure{"'ir' input not connected or wrong type"});
     }
+    log("nasm_gen[" + id_ + "]: lowering " + std::to_string(mod->code.size()) + " IR instrs");
 
     const std::vector<cc::nasm::instr> instrs = cc::gen::lower(*mod);
     const std::string listing = cc::gen::format(instrs);
+    log("nasm_gen[" + id_ + "]: listing " + std::to_string(listing.size()) + " bytes");
 
     for (auto& [slot_id, out] : outputs) {
       if (slot_id == "asm") {
@@ -187,25 +189,32 @@ class assemble_node final : public node {
     asm_path += ".asm";
     std::filesystem::path obj_path = exe;
     obj_path += ".o";
+    log("assemble[" + id_ + "]: writing " + asm_path.string());
 
     {
       std::ofstream os{asm_path};
       if (!os) {
+        log("assemble[" + id_ + "]: cannot write asm file");
         return std::unexpected(failure{"cannot write '" + asm_path.string() + "'"});
       }
       os << *asm_text;
     }
+    log("assemble[" + id_ + "]: running nasm");
     if (std::system(("nasm -f elf64 " + asm_path.string() + " -o " + obj_path.string()).c_str()) != 0) {
+      log("assemble[" + id_ + "]: nasm failed");
       std::remove(asm_path.string().c_str());
       return std::unexpected(failure{"nasm failed (see console)"});
     }
+    log("assemble[" + id_ + "]: running ld");
     if (std::system(("ld " + obj_path.string() + " -o " + exe.string()).c_str()) != 0) {
+      log("assemble[" + id_ + "]: ld failed");
       std::remove(asm_path.string().c_str());
       std::remove(obj_path.string().c_str());
       return std::unexpected(failure{"ld failed (see console)"});
     }
     std::remove(asm_path.string().c_str());
     std::remove(obj_path.string().c_str());
+    log("assemble[" + id_ + "]: ok, exe = " + exe.string());
 
     for (auto& [slot_id, out] : outputs) {
       if (slot_id == "exe") {

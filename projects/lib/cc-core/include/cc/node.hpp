@@ -4,6 +4,7 @@
 #include "cc/any_value.hpp"
 
 #include <expected>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -77,7 +78,25 @@ class CC_CORE_API node {
   // slot's any_value* in place. Failure → runner surfaces the diagnostic and
   // stops downstream evaluation.
   virtual auto activate(std::span<const input_pair>  inputs,
-                        std::span<output_pair>       outputs) -> activate_result = 0;
+                         std::span<output_pair>       outputs) -> activate_result = 0;
+
+  // ---- Diagnostic logging -------------------------------------------------
+  // Logger is set by the runner just before activate() and cleared after.
+  // Plugins call this->log("...") inside activate for diagnostic output;
+  // messages flow into the host's Logger tab. Safe to call from any thread
+  // (the host's log sink is responsible for synchronization).
+  using log_callback = std::function<void(std::string_view)>;
+  void set_logger(log_callback cb) { log_cb_ = std::move(cb); }
+
+ protected:
+  // Emit a diagnostic message. No-op if no logger is attached (e.g. when
+  // activate is called outside a runner context, as in unit tests).
+  void log(std::string_view msg) const {
+    if (log_cb_) log_cb_(msg);
+  }
+
+ private:
+  log_callback log_cb_;
 };
 
 }  // namespace cc

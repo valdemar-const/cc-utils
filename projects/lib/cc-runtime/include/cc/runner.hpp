@@ -6,6 +6,7 @@
 #include "cc/node.hpp"
 
 #include <expected>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -25,7 +26,9 @@ namespace cc::runtime {
 //   - returned pointers are stable until the runner is destroyed.
 class CC_RUNTIME_API runner {
  public:
-  explicit runner(graph& g);
+  using log_callback = std::function<void(std::string_view)>;
+
+  explicit runner(graph& g, log_callback logger = {});
 
   // Pull value at (node_id, slot_id). Recursively activates upstream nodes.
   // Returns a pointer into the runner's cache (stable for the runner's
@@ -38,7 +41,8 @@ class CC_RUNTIME_API runner {
   // failure on the first upstream error.
   auto ensure_outputs(std::string_view node_id) -> std::expected<void, failure>;
 
-  graph& g_;
+  graph&             g_;
+  log_callback       logger_;
   std::unordered_map<std::string, std::unordered_map<std::string, any_value>> cache_;
   std::unordered_set<std::string> completed_;
   std::unordered_set<std::string> in_progress_;

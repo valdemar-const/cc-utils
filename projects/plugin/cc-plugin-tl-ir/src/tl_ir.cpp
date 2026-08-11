@@ -97,10 +97,13 @@ class irgen_node final : public node {
       }
     }
     if (ast_ptr == nullptr || *ast_ptr == nullptr || (*ast_ptr)->root == nullptr) {
+      log("tl.irgen[" + id_ + "]: ast input missing or empty");
       return std::unexpected(failure{"'ast' input missing or invalid"});
     }
+    log("tl.irgen[" + id_ + "]: lowering AST");
 
     cc::ir::module mod = cc::astq::lower(*(*ast_ptr)->root);
+    log("tl.irgen[" + id_ + "]: emitted " + std::to_string(mod.code.size()) + " instrs");
 
     for (auto& [slot_id, out] : outputs) {
       if (slot_id == "ir") {

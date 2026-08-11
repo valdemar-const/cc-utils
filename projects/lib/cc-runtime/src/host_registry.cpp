@@ -102,8 +102,14 @@ class host_registry_impl final : public host_registry {
     std::string id{factory->type_id()};
     node_factory* raw = factory.get();
     factories_storage_.push_back(std::move(factory));
-    factories_by_id_[std::move(id)] = raw;
+    factories_by_id_[id] = raw;
     factories_order_.push_back(raw);
+    // Attribute the new factory to the innermost active provider, if any.
+    // Host-side factories registered outside any push/pop scope get an empty
+    // provider string (= unknown), which is fine for our purposes.
+    if (!provider_stack_.empty()) {
+      provider_by_type_[id] = provider_stack_.back();
+    }
   }
 
   auto find_node_factory(std::string_view type_id) const -> node_factory* override {
@@ -117,12 +123,36 @@ class host_registry_impl final : public host_registry {
 
   auto renderers() -> view_renderer_provider& override { return renderers_; }
 
+  // ---- provider bookkeeping ----
+  auto push_provider(std::string_view name) -> void override {
+    provider_stack_.emplace_back(name);
+    // Record on first sight so loaded_plugins() reports every plugin we ever
+    // entered a scope for, even if it registered zero factories.
+    if (std::find(loaded_plugins_.begin(), loaded_plugins_.end(),
+                  provider_stack_.back()) == loaded_plugins_.end()) {
+      loaded_plugins_.push_back(provider_stack_.back());
+    }
+  }
+  auto pop_provider() -> void override {
+    if (!provider_stack_.empty()) provider_stack_.pop_back();
+  }
+  auto provider_of(std::string_view type_id) const -> std::string_view override {
+    auto it = provider_by_type_.find(std::string{type_id});
+    return it == provider_by_type_.end() ? std::string_view{} : it->second;
+  }
+  auto loaded_plugins() const -> std::span<const std::string> override {
+    return loaded_plugins_;
+  }
+
  private:
   type_registry_impl                                  types_;
   view_renderer_provider_impl                         renderers_;
   std::vector<std::unique_ptr<node_factory>>          factories_storage_;
   std::unordered_map<std::string, node_factory*>      factories_by_id_;
   std::vector<node_factory*>                          factories_order_;
+  std::vector<std::string>                            provider_stack_;
+  std::vector<std::string>                            loaded_plugins_;
+  std::unordered_map<std::string, std::string>        provider_by_type_;
 };
 
 // ===========================================================================

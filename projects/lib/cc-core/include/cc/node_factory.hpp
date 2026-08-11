@@ -56,8 +56,28 @@ class CC_CORE_API node_factory {
   // is empty (no editable properties).
   virtual auto property_schema() const -> std::span<const property_desc> { return {}; }
 
-  // Create a fresh node instance with default property values.
+  // Create a fresh node instance with default property values and a freshly
+  // generated instance_id.
   virtual auto create() const -> std::unique_ptr<node> = 0;
+
+  // Create a node instance reusing an explicit instance_id. Used when loading
+  // a pipeline from disk: edges reference instance_ids, so the created nodes
+  // must keep those exact ids. Implementations must not generate a new id.
+  // Implementations should accept any non-empty instance_id, even if its
+  // suffix doesn't follow this factory's usual scheme.
+  virtual auto create_with_id(std::string_view instance_id) const
+      -> std::unique_ptr<node> = 0;
+
+ protected:
+  // Helper for subclasses: stamp the schema's default property values onto a
+  // freshly constructed node and return it. Both create() and create_with_id()
+  // share this to keep property initialisation in one place.
+  auto apply_defaults(std::unique_ptr<node> n) const -> std::unique_ptr<node> {
+    for (auto const& d : property_schema()) {
+      n->properties().set(d.key, d.default_value);
+    }
+    return n;
+  }
 };
 
 }  // namespace cc

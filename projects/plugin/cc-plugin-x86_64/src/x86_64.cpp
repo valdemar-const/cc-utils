@@ -95,6 +95,9 @@ class exe_out_slot final : public slot {
 // ---------------------------------------------------------------------------
 class nasm_gen_node final : public node {
  public:
+  nasm_gen_node() : id_(fresh_instance_id("x86_64.nasm_gen")) {}
+  explicit nasm_gen_node(std::string id) : id_(std::move(id)) {}
+
   auto type_id()     const -> std::string_view override { return "x86_64.nasm_gen"; }
   auto instance_id() const -> std::string_view override { return id_; }
 
@@ -135,7 +138,7 @@ class nasm_gen_node final : public node {
   }
 
  private:
-  std::string id_{fresh_instance_id("x86_64.nasm_gen")};
+  std::string id_;
   props       props_;
 };
 
@@ -148,6 +151,10 @@ class nasm_gen_factory final : public node_factory {
   auto create() const -> std::unique_ptr<node> override {
     return std::make_unique<nasm_gen_node>();
   }
+  auto create_with_id(std::string_view instance_id) const
+      -> std::unique_ptr<node> override {
+    return std::make_unique<nasm_gen_node>(std::string{instance_id});
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -155,6 +162,9 @@ class nasm_gen_factory final : public node_factory {
 // ---------------------------------------------------------------------------
 class assemble_node final : public node {
  public:
+  assemble_node() : id_(fresh_instance_id("x86_64.assemble")) {}
+  explicit assemble_node(std::string id) : id_(std::move(id)) {}
+
   auto type_id()     const -> std::string_view override { return "x86_64.assemble"; }
   auto instance_id() const -> std::string_view override { return id_; }
 
@@ -226,7 +236,7 @@ class assemble_node final : public node {
   }
 
  private:
-  std::string id_{fresh_instance_id("x86_64.assemble")};
+  std::string id_;
   props       props_;
 };
 
@@ -244,11 +254,11 @@ class assemble_factory final : public node_factory {
   }
 
   auto create() const -> std::unique_ptr<node> override {
-    auto n = std::make_unique<assemble_node>();
-    for (auto const& d : property_schema()) {
-      n->properties().set(d.key, d.default_value);
-    }
-    return n;
+    return apply_defaults(std::make_unique<assemble_node>());
+  }
+  auto create_with_id(std::string_view instance_id) const
+      -> std::unique_ptr<node> override {
+    return apply_defaults(std::make_unique<assemble_node>(std::string{instance_id}));
   }
 };
 

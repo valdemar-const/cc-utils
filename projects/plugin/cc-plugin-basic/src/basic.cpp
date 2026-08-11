@@ -99,6 +99,9 @@ class any_in_slot final : public slot {
 // ---------------------------------------------------------------------------
 class from_file_node final : public node {
  public:
+  from_file_node() : id_(fresh_instance_id("basic.text.from_file")) {}
+  explicit from_file_node(std::string id) : id_(std::move(id)) {}
+
   auto type_id()     const -> std::string_view override { return "basic.text.from_file"; }
   auto instance_id() const -> std::string_view override { return id_; }
 
@@ -138,7 +141,7 @@ class from_file_node final : public node {
   }
 
  private:
-  std::string id_{fresh_instance_id("basic.text.from_file")};
+  std::string id_;
   props       props_;
 };
 
@@ -156,11 +159,11 @@ class from_file_factory final : public node_factory {
   }
 
   auto create() const -> std::unique_ptr<node> override {
-    auto n = std::make_unique<from_file_node>();
-    for (auto const& d : property_schema()) {
-      n->properties().set(d.key, d.default_value);
-    }
-    return n;
+    return apply_defaults(std::make_unique<from_file_node>());
+  }
+  auto create_with_id(std::string_view instance_id) const
+      -> std::unique_ptr<node> override {
+    return apply_defaults(std::make_unique<from_file_node>(std::string{instance_id}));
   }
 };
 
@@ -171,6 +174,9 @@ class from_file_factory final : public node_factory {
 // ---------------------------------------------------------------------------
 class constant_node final : public node {
  public:
+  constant_node() : id_(fresh_instance_id("basic.text.constant")) {}
+  explicit constant_node(std::string id) : id_(std::move(id)) {}
+
   auto type_id()     const -> std::string_view override { return "basic.text.constant"; }
   auto instance_id() const -> std::string_view override { return id_; }
 
@@ -196,7 +202,7 @@ class constant_node final : public node {
   }
 
  private:
-  std::string id_{fresh_instance_id("basic.text.constant")};
+  std::string id_;
   props       props_;
 };
 
@@ -214,11 +220,11 @@ class constant_factory final : public node_factory {
   }
 
   auto create() const -> std::unique_ptr<node> override {
-    auto n = std::make_unique<constant_node>();
-    for (auto const& d : property_schema()) {
-      n->properties().set(d.key, d.default_value);
-    }
-    return n;
+    return apply_defaults(std::make_unique<constant_node>());
+  }
+  auto create_with_id(std::string_view instance_id) const
+      -> std::unique_ptr<node> override {
+    return apply_defaults(std::make_unique<constant_node>(std::string{instance_id}));
   }
 };
 
@@ -227,6 +233,9 @@ class constant_factory final : public node_factory {
 // ---------------------------------------------------------------------------
 class view_node final : public node {
  public:
+  view_node() : id_(fresh_instance_id("basic.view")) {}
+  explicit view_node(std::string id) : id_(std::move(id)) {}
+
   auto type_id()     const -> std::string_view override { return "basic.view"; }
   auto instance_id() const -> std::string_view override { return id_; }
 
@@ -245,7 +254,7 @@ class view_node final : public node {
   }
 
  private:
-  std::string id_{fresh_instance_id("basic.view")};
+  std::string id_;
   props       props_;
 };
 
@@ -263,11 +272,11 @@ class view_factory final : public node_factory {
   }
 
   auto create() const -> std::unique_ptr<node> override {
-    auto n = std::make_unique<view_node>();
-    for (auto const& d : property_schema()) {
-      n->properties().set(d.key, d.default_value);
-    }
-    return n;
+    return apply_defaults(std::make_unique<view_node>());
+  }
+  auto create_with_id(std::string_view instance_id) const
+      -> std::unique_ptr<node> override {
+    return apply_defaults(std::make_unique<view_node>(std::string{instance_id}));
   }
 };
 
@@ -328,6 +337,9 @@ class text_out_cerr_slot final : public slot {
 
 class exec_node final : public node {
  public:
+  exec_node() : id_(fresh_instance_id("basic.exec")) {}
+  explicit exec_node(std::string id) : id_(std::move(id)) {}
+
   auto type_id()     const -> std::string_view override { return "basic.exec"; }
   auto instance_id() const -> std::string_view override { return id_; }
 
@@ -442,7 +454,7 @@ class exec_node final : public node {
   }
 
  private:
-  std::string id_{fresh_instance_id("basic.exec")};
+  std::string id_;
   props       props_;
 };
 
@@ -460,11 +472,11 @@ class exec_factory final : public node_factory {
   }
 
   auto create() const -> std::unique_ptr<node> override {
-    auto n = std::make_unique<exec_node>();
-    for (auto const& d : property_schema()) {
-      n->properties().set(d.key, d.default_value);
-    }
-    return n;
+    return apply_defaults(std::make_unique<exec_node>());
+  }
+  auto create_with_id(std::string_view instance_id) const
+      -> std::unique_ptr<node> override {
+    return apply_defaults(std::make_unique<exec_node>(std::string{instance_id}));
   }
 };
 

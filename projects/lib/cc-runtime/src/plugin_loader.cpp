@@ -100,6 +100,14 @@ auto plugin_loader::load_path(const std::string& path, host_registry& host) -> s
 
   // cc_plugin_register — populate the host.
   auto register_fn = lib->get<void(cc::host_registry&)>("cc_plugin_register");
+  // Attribute every factory registered during this call to the plugin's
+  // declared name. Scope guard guarantees pop_provider() even if register_fn
+  // throws — keeps host bookkeeping consistent on partial failure.
+  host.push_provider(info.name ? info.name : "");
+  struct provider_guard {
+    host_registry& h;
+    ~provider_guard() { h.pop_provider(); }
+  } guard{host};
   register_fn(host);
 
   pimpl_->libs.push_back(std::move(lib));

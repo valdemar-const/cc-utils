@@ -75,6 +75,9 @@ class ir_out_slot final : public slot {
 // ---------------------------------------------------------------------------
 class irgen_node final : public node {
  public:
+  irgen_node() : id_(fresh_instance_id("tl.irgen")) {}
+  explicit irgen_node(std::string id) : id_(std::move(id)) {}
+
   auto type_id()     const -> std::string_view override { return "tl.irgen"; }
   auto instance_id() const -> std::string_view override { return id_; }
 
@@ -115,7 +118,7 @@ class irgen_node final : public node {
   }
 
  private:
-  std::string id_{fresh_instance_id("tl.irgen")};
+  std::string id_;
   props       props_;
 };
 
@@ -127,6 +130,10 @@ class irgen_factory final : public node_factory {
 
   auto create() const -> std::unique_ptr<node> override {
     return std::make_unique<irgen_node>();
+  }
+  auto create_with_id(std::string_view instance_id) const
+      -> std::unique_ptr<node> override {
+    return std::make_unique<irgen_node>(std::string{instance_id});
   }
 };
 

@@ -27,6 +27,7 @@
 #include "ImGuiColorTextEdit/TextEditor.h"
 #include "ne/builders.h"
 #include "ne/widgets.h"
+#include "pipeline_xml.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -161,10 +162,39 @@ struct AppState {
   struct pending_position { int ed_id; ImVec2 canvas_pos; };
   std::vector<pending_position> pending_positions;
 
+  // Last-known canvas positions, refreshed every frame inside ed::Begin/End.
+  // We must not call ed::GetNodePosition outside the editor's active context
+  // (it crashes when SetCurrentEditor(nullptr) has run, which happens after
+  // every Pipeline tab frame). So Save reads from this cache instead.
+  std::unordered_map<std::string, ImVec2> node_positions;
+
   // Status / menu state.
   std::size_t loaded_plugins      = 0;
   bool        about_open          = false;
   bool        canvas_navigate_content = false;
+
+  // ---- Pipeline file state ----
+  // The on-disk path of the pipeline currently shown in the canvas. Empty
+  // means "untitled" — Save will prompt for a path via Save as.
+  std::string pipeline_path;
+  // True when there are unsaved changes. Bumped by every graph mutation
+  // (see invalidate_view_cache); cleared by Save and by New/Open.
+  bool        pipeline_dirty      = false;
+
+  // Modals. Each *_open flag drives a small centered popup; the *_text field
+  // carries the message to display. Keeping the data in g_state lets the
+  // menu handlers and the Gui callback stay decoupled (no shared globals
+  // beyond AppState itself).
+  bool        load_error_open     = false;
+  std::string load_error_text;
+  bool        load_warnings_open  = false;
+  std::string load_warnings_text;
+
+  // Unsaved-changes confirmation. When the user requests New/Open/Quit while
+  // pipeline_dirty is true we stash the pending action here and let the
+  // modal drive it after the user picks Save / Don't Save / Cancel.
+  enum class pending_action { none, new_pipeline, open_pipeline, quit };
+  pending_action unsaved_pending = pending_action::none;
 
   // View tab cache. Pulling is expensive (Exec spawns a child, Assemble runs
   // nasm+ld, ...) and doing it synchronously in the UI thread would freeze
@@ -249,9 +279,16 @@ noop_view_context g_view_ctx;
 // node/edge/property change site. Marks cache stale and stamps the time so
 // the View tab can debounce auto-pull (avoid storming pulls on every keystroke
 // in a multiline property editor).
+//
+// We also stamp `pipeline_dirty` here: every existing call site is a graph
+// mutation (add/remove node, add/remove edge, property edit), so the file is
+// out of sync with disk after this. Sites that aren't graph mutations (e.g.
+// picking a View tab from the Combo) set the cache flags directly instead of
+// calling this helper, so they don't bump pipeline_dirty.
 inline void invalidate_view_cache() {
   g_state.view_cache_stale  = true;
   g_state.view_stale_since  = std::chrono::steady_clock::now();
+  g_state.pipeline_dirty    = true;
 }
 
 void log(std::string msg) {
@@ -491,25 +528,16 @@ class path_view_renderer final : public cc::view_renderer {
 };
 
 // ---------------------------------------------------------------------------
-// File-dialog poll
+// File-dialog poll + File-menu action openers
 // ---------------------------------------------------------------------------
-void poll_file_dialog() {
-  constexpr const char* kDlg = "node_path";
-  if (!ifd::FileDialog::Instance().IsDone(kDlg)) return;
-  if (ifd::FileDialog::Instance().HasResult()) {
-    std::string path = ifd::FileDialog::Instance().GetResult().string();
-    if (!g_state.file_dialog_target.instance.empty()) {
-      auto* n = g_state.g.find_node(g_state.file_dialog_target.instance);
-      if (n) {
-        n->properties().set(g_state.file_dialog_target.key, path);
-        invalidate_view_cache();
-        log("set " + g_state.file_dialog_target.key + " = " + path +
-            " on " + g_state.file_dialog_target.instance);
-      }
-    }
-  }
-  ifd::FileDialog::Instance().Close();
-}
+// Defined later in this file (after the do_open_pipeline / do_save_pipeline
+// helpers they call). The "node_path" branch handles the property Browse
+// button; "open_pipeline" and "save_pipeline" are the File → Open / Save as
+// flows. Each is keyed by a string id so we can run several concurrently.
+void poll_file_dialog();
+void request_open_pipeline_dialog();
+void request_save_as_dialog();
+void do_save_or_save_as();
 
 // ---------------------------------------------------------------------------
 // Schema-driven property widgets
@@ -925,9 +953,250 @@ void clear_graph() {
   }
   g_state.inst2ed.clear();
   g_state.ed2inst.clear();
+  g_state.node_positions.clear();
   g_state.view_selected.clear();
   invalidate_view_cache();
   log("graph cleared");
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline file ops — New / Open / Save / Save as
+// ---------------------------------------------------------------------------
+// All four are funnelled through request_action_with_unsaved_check(): when
+// the user is about to discard unsaved changes, a confirmation modal asks
+// whether to Save / Don't Save / Cancel. The choice eventually reaches
+// execute_pending_action(), which dispatches back into the do_* helpers.
+
+// Last directory used by an ImFileDialog open/save. ImFileDialog itself is
+// stateless across dialogs (we use distinct dialog ids), so we remember it
+// ourselves and seed the next dialog. First call seeds from the current
+// pipeline path's parent dir, or the working dir as a last resort.
+std::string g_last_file_dir;
+
+auto last_file_dir() -> const std::string& {
+  if (!g_last_file_dir.empty()) return g_last_file_dir;
+  if (!g_state.pipeline_path.empty()) {
+    std::error_code ec;
+    auto parent = std::filesystem::path(g_state.pipeline_path).parent_path();
+    if (!parent.empty()) {
+      g_last_file_dir = parent.string();
+      return g_last_file_dir;
+    }
+  }
+  g_last_file_dir = std::filesystem::current_path().string();
+  return g_last_file_dir;
+}
+
+// Display name for the window title — basename of the pipeline path, or
+// "untitled.pipeline" if no path is set yet.
+auto pipeline_display_name() -> std::string {
+  if (g_state.pipeline_path.empty()) return "untitled.pipeline";
+  return std::filesystem::path(g_state.pipeline_path).filename().string();
+}
+
+// Run the load: parse XML, populate the graph, restore positions, surface
+// warnings/errors. Returns true on success.
+auto do_open_pipeline(const std::string& path) -> bool {
+  auto result = cc::workbench::load_pipeline(*g_state.host, g_state.g, path);
+  if (!result) {
+    g_state.load_error_text = result.error();
+    g_state.load_error_open = true;
+    log("open failed: " + result.error());
+    return false;
+  }
+  auto& lr = *result;
+
+  // Apply restored positions: schedule ed::SetNodePosition for each instance
+  // next frame inside ed::Begin/End (where the editor context is live).
+  g_state.inst2ed.clear();
+  g_state.ed2inst.clear();
+  g_state.node_positions.clear();   // stale positions from previous graph
+  for (auto const& n : g_state.g.nodes()) {
+    editor_id_for(std::string{n->instance_id()});  // primes both maps
+  }
+  for (auto const& [instance, p] : lr.positions) {
+    int ed_id = editor_id_for(instance);  // safe to re-call, idempotent
+    g_state.pending_positions.push_back({ed_id, ImVec2(p.x, p.y)});
+    // Seed the cache too so an immediate Save before the next frame picks
+    // them up — draw_pipeline_canvas will overwrite with the live value.
+    g_state.node_positions[instance] = ImVec2(p.x, p.y);
+  }
+
+  g_state.pipeline_path = path;
+  g_state.pipeline_dirty = false;
+  g_state.view_selected.clear();
+
+  // Auto Zoom-to-Fit so the user sees the restored graph immediately rather
+  // than staring at the previously-empty viewport.
+  g_state.canvas_navigate_content = true;
+
+  // Surface warnings (missing plugins, skipped nodes/edges) without blocking
+  // the load — the user can still inspect whatever survived.
+  std::string warn_text;
+  auto append_group = [&](const char* title, const std::vector<std::string>& items) {
+    if (items.empty()) return;
+    if (!warn_text.empty()) warn_text += "\n\n";
+    warn_text += title;
+    for (auto const& it : items) {
+      warn_text += "\n  • ";
+      warn_text += it;
+    }
+  };
+  append_group("Missing plugins (some node types may be unavailable):",
+               lr.warnings.missing_plugins);
+  append_group("Unknown node types (skipped):", lr.warnings.unknown_node_types);
+  append_group("Edges to skipped nodes (skipped):", lr.warnings.skipped_edges);
+  if (!warn_text.empty()) {
+    g_state.load_warnings_text = std::move(warn_text);
+    g_state.load_warnings_open = true;
+  }
+
+  log("opened " + path);
+  return true;
+}
+
+// Collect current canvas positions from the imgui-node-editor cache and
+// serialise. We can't call ed::GetNodePosition here: do_save_pipeline runs
+// in a menu handler outside ed::Begin/End, where no editor context is
+// current (SetCurrentEditor(nullptr) runs at the end of each Pipeline tab
+// frame). Reading from g_state.node_positions — populated every frame from
+// inside ed::Begin/End — is the safe path.
+auto do_save_pipeline(const std::string& path) -> bool {
+  std::unordered_map<std::string, cc::workbench::pos> positions;
+  for (auto const& n : g_state.g.nodes()) {
+    std::string id{n->instance_id()};
+    auto it = g_state.node_positions.find(id);
+    if (it != g_state.node_positions.end()) {
+      positions[id] = {it->second.x, it->second.y};
+    }
+  }
+  auto res = cc::workbench::save_pipeline(*g_state.host, g_state.g, positions, path);
+  if (!res) {
+    g_state.load_error_text = res.error();
+    g_state.load_error_open = true;
+    log("save failed: " + res.error());
+    return false;
+  }
+  g_state.pipeline_path  = path;
+  g_state.pipeline_dirty = false;
+  g_last_file_dir = std::filesystem::path(path).parent_path().string();
+  log("saved " + path);
+  return true;
+}
+
+// File → New: clear the canvas, drop the path, start fresh.
+auto do_new_pipeline() -> void {
+  clear_graph();
+  g_state.pipeline_path.clear();
+  g_state.pipeline_dirty = false;
+  log("new pipeline");
+}
+
+// Forward decls — the modal handlers reach back into the menu actions.
+void request_open_pipeline_dialog();
+void request_save_as_dialog();
+
+// Execute the action the user picked at the confirmation modal (or that was
+// queued directly when there were no unsaved changes to confirm).
+void execute_pending_action() {
+  switch (g_state.unsaved_pending) {
+    case AppState::pending_action::new_pipeline:
+      do_new_pipeline();
+      break;
+    case AppState::pending_action::open_pipeline:
+      request_open_pipeline_dialog();
+      break;
+    case AppState::pending_action::quit:
+      HelloImGui::GetRunnerParams()->appShallExit = true;
+      break;
+    case AppState::pending_action::none:
+      break;
+  }
+  g_state.unsaved_pending = AppState::pending_action::none;
+}
+
+// Gate an action that would discard unsaved changes. If the graph is dirty,
+// stash the action and open the confirm modal; otherwise run it immediately.
+auto request_action_with_unsaved_check(AppState::pending_action action) -> void {
+  if (!g_state.pipeline_dirty) {
+    g_state.unsaved_pending = action;
+    execute_pending_action();
+    return;
+  }
+  g_state.unsaved_pending = action;
+}
+
+// ---------------------------------------------------------------------------
+// Definitions of the ImFileDialog poll + openers (forward-declared earlier
+// because the property editor uses poll_file_dialog, which in turn needs the
+// do_open_pipeline / do_save_pipeline helpers defined just above).
+// ---------------------------------------------------------------------------
+void poll_file_dialog() {
+  // ---- node_path: property Browse button ----
+  if (ifd::FileDialog::Instance().IsDone("node_path")) {
+    if (ifd::FileDialog::Instance().HasResult()) {
+      std::string path = ifd::FileDialog::Instance().GetResult().string();
+      if (!g_state.file_dialog_target.instance.empty()) {
+        auto* n = g_state.g.find_node(g_state.file_dialog_target.instance);
+        if (n) {
+          n->properties().set(g_state.file_dialog_target.key, path);
+          invalidate_view_cache();
+          log("set " + g_state.file_dialog_target.key + " = " + path +
+              " on " + g_state.file_dialog_target.instance);
+        }
+      }
+      g_last_file_dir = std::filesystem::path(path).parent_path().string();
+    }
+    ifd::FileDialog::Instance().Close();
+  }
+
+  // ---- open_pipeline: File → Open ----
+  if (ifd::FileDialog::Instance().IsDone("open_pipeline")) {
+    if (ifd::FileDialog::Instance().HasResult()) {
+      std::string path = ifd::FileDialog::Instance().GetResult().string();
+      do_open_pipeline(path);
+      g_last_file_dir = std::filesystem::path(path).parent_path().string();
+    }
+    ifd::FileDialog::Instance().Close();
+  }
+
+  // ---- save_pipeline: File → Save as ----
+  if (ifd::FileDialog::Instance().IsDone("save_pipeline")) {
+    if (ifd::FileDialog::Instance().HasResult()) {
+      std::string path = ifd::FileDialog::Instance().GetResult().string();
+      // If the user typed a name without the .pipeline suffix, add it — this
+      // matches desktop-app behaviour where Save doesn't punish the user for
+      // forgetting the extension.
+      if (std::filesystem::path(path).extension() != ".pipeline") {
+        path += ".pipeline";
+      }
+      do_save_pipeline(path);
+    }
+    ifd::FileDialog::Instance().Close();
+  }
+}
+
+void request_open_pipeline_dialog() {
+  ifd::FileDialog::Instance().Open("open_pipeline", "Open Pipeline",
+                                   "*.pipeline", false,
+                                   last_file_dir());
+}
+
+void request_save_as_dialog() {
+  // ImFileDialog's Save() has no default-filename parameter, only a starting
+  // dir; the user types the name in the dialog. That's acceptable — save-as
+  // semantics are clear enough without prefilling.
+  ifd::FileDialog::Instance().Save("save_pipeline", "Save Pipeline As",
+                                   "*.pipeline",
+                                   last_file_dir());
+}
+
+void do_save_or_save_as() {
+  if (!g_state.pipeline_path.empty()) {
+    do_save_pipeline(g_state.pipeline_path);
+    return;
+  }
+  request_save_as_dialog();
 }
 
 // Run the pipeline end-to-end: find an x86_64.assemble node, pull its "exe"
@@ -1159,6 +1428,7 @@ void draw_pipeline_canvas() {
           g_state.g.remove_node(instance);
           if (g_state.view_selected == instance) g_state.view_selected.clear();
             g_state.inst2ed.erase(instance);
+            g_state.node_positions.erase(instance);
             g_state.ed2inst.erase(it);
             invalidate_view_cache();
             log("deleted node " + instance);
@@ -1216,6 +1486,16 @@ void draw_pipeline_canvas() {
   if (g_state.canvas_navigate_content) {
     ed::NavigateToContent();
     g_state.canvas_navigate_content = false;
+  }
+
+  // Cache canvas positions every frame so Save (which runs outside
+  // ed::Begin/End, with the editor context cleared) can read them. Done here
+  // after every node has been submitted so GetNodePosition returns fresh,
+  // stable coordinates for every existing node.
+  for (auto const& n : g_state.g.nodes()) {
+    int ed_id = editor_id_for(std::string{n->instance_id()});
+    g_state.node_positions[std::string{n->instance_id()}] =
+        ed::GetNodePosition(ed_id);
   }
 
   ed::End();
@@ -1276,7 +1556,10 @@ void draw_view_window() {
   if (ImGui::Combo("##view_select", &current_idx, getter, &views,
                    static_cast<int>(views.size()))) {
     g_state.view_selected = views[current_idx].instance;
-    invalidate_view_cache();
+    // Pure UI selection — invalidate cache so the new target gets pulled next
+    // frame, but don't bump pipeline_dirty: nothing on disk has changed.
+    g_state.view_cache_stale = true;
+    g_state.view_stale_since = std::chrono::steady_clock::now();
   }
 
   ImGui::SameLine();
@@ -1378,21 +1661,74 @@ void draw_view_window() {
 
 void draw_main_menu(HelloImGui::DockingParams& docking) {
   // ---- File ----
-  // Only truly global commands live here: tab creation (future), app quit.
-  // Canvas-specific actions (Clear, Run, ...) belong to the canvas toolbar.
   if (ImGui::BeginMenu("File")) {
+    if (ImGui::MenuItem("New", "Ctrl+N")) {
+      request_action_with_unsaved_check(AppState::pending_action::new_pipeline);
+    }
+    if (ImGui::MenuItem("Open...", "Ctrl+O")) {
+      request_action_with_unsaved_check(AppState::pending_action::open_pipeline);
+    }
+    ImGui::Separator();
+    if (ImGui::MenuItem("Save", "Ctrl+S")) {
+      do_save_or_save_as();
+    }
+    if (ImGui::MenuItem("Save as...")) {
+      request_save_as_dialog();
+    }
+    ImGui::Separator();
     if (ImGui::MenuItem("Quit", "Alt+F4")) {
-      HelloImGui::GetRunnerParams()->appShallExit = true;
+      request_action_with_unsaved_check(AppState::pending_action::quit);
     }
     ImGui::EndMenu();
   }
 
-  // ---- View (window visibility toggles) ----
+  // ---- View ----
+  // Three logical groups:
+  //   1. Open tab — show windows that aren't permanently visible.
+  //   2. Window visibility for includeInViewMenu=true windows (Logger, etc.).
+  //   3. Layout management — Reset restores the initial docking splits; the
+  //      Switch layout submenu is a placeholder for future named profiles,
+  //      currently only "default" (= reset).
   if (ImGui::BeginMenu("View")) {
+    if (ImGui::BeginMenu("Open tab")) {
+      // Iterate windows that are closeable but exclude always-visible ones.
+      // The Pipeline / View / Logger windows all carry canBeClosed=false in
+      // main(); make them openable on demand by name so a closed-by-user
+      // window (e.g. View, once we lift the canBeClosed flag) can come back.
+      for (auto& w : docking.dockableWindows) {
+        if (w.label == "Pipeline" || w.label == "View" || w.label == "Logger") {
+          if (ImGui::MenuItem(w.label.c_str())) {
+            w.isVisible = true;
+          }
+        }
+      }
+      ImGui::EndMenu();
+    }
+
+    ImGui::Separator();
+
+    // Generic visibility toggles for any window that opts into the View menu
+    // via includeInViewMenu=true (kept for forward compat; currently unused
+    // since Pipeline/View/Logger all have it set false in main()).
     for (auto& w : docking.dockableWindows) {
       if (w.includeInViewMenu) {
         ImGui::MenuItem(w.label.c_str(), nullptr, &w.isVisible);
       }
+    }
+
+    ImGui::Separator();
+
+    if (ImGui::MenuItem("Reset layout", nullptr)) {
+      HelloImGui::GetRunnerParams()->dockingParams.layoutReset = true;
+    }
+    if (ImGui::BeginMenu("Switch layout")) {
+      if (ImGui::MenuItem("default")) {
+        // Only one named layout exists today — selecting it is the same as a
+        // Reset. The submenu exists so the discoverable entry matches the
+        // user story; additional named layouts will slot in alongside.
+        HelloImGui::GetRunnerParams()->dockingParams.layoutReset = true;
+      }
+      ImGui::EndMenu();
     }
     ImGui::EndMenu();
   }
@@ -1403,6 +1739,149 @@ void draw_main_menu(HelloImGui::DockingParams& docking) {
       g_state.about_open = true;
     }
     ImGui::EndMenu();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Global hotkeys: Ctrl+N / Ctrl+O / Ctrl+S.
+// Routed to the same handlers as the menu items so the menu and the keyboard
+// shortcut always agree, even when a modal is reinterpreting the action.
+// ---------------------------------------------------------------------------
+void process_global_hotkeys() {
+  // Refresh the OS window title to reflect the current file + dirty mark.
+  // HelloImGui reads this field every frame.
+  std::string title = pipeline_display_name();
+  if (g_state.pipeline_dirty) title += " *";
+  title += " — cc-workbench";
+  HelloImGui::GetRunnerParams()->appWindowParams.windowTitle = title;
+
+  // Skip hotkeys while an ImGui text input has active focus — Ctrl+S inside
+  // an InputText is "save this buffer" semantically; we shouldn't hijack it.
+  ImGuiIO& io = ImGui::GetIO();
+  if (io.WantTextInput) return;
+
+  if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_N)) {
+    request_action_with_unsaved_check(AppState::pending_action::new_pipeline);
+  }
+  if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_O)) {
+    request_action_with_unsaved_check(AppState::pending_action::open_pipeline);
+  }
+  if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) {
+    do_save_or_save_as();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Modals
+// ---------------------------------------------------------------------------
+void draw_load_error_modal() {
+  static bool should_open = false;
+  if (g_state.load_error_open) { should_open = true; g_state.load_error_open = false; }
+  if (should_open) {
+    ImGui::OpenPopup("Pipeline Error");
+    should_open = false;
+  }
+  ImGui::SetNextWindowSize(ImVec2(440, 0), ImGuiCond_Appearing);
+  if (ImGui::BeginPopupModal("Pipeline Error", nullptr,
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings)) {
+    ImGui::TextDisabled("Could not complete the operation:");
+    ImGui::Spacing();
+    // Wrap the message to the modal width.
+    ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + ImGui::GetContentRegionAvail().x);
+    ImGui::TextUnformatted(g_state.load_error_text.c_str());
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+    float bw = 120.0f;
+    ImGui::SetCursorPosX(ImGui::GetContentRegionAvail().x - bw + ImGui::GetCursorPosX());
+    if (ImGui::Button("OK", ImVec2(bw, 0))) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+  }
+}
+
+void draw_load_warnings_modal() {
+  static bool should_open = false;
+  if (g_state.load_warnings_open) { should_open = true; g_state.load_warnings_open = false; }
+  if (should_open) {
+    ImGui::OpenPopup("Pipeline Loaded with Warnings");
+    should_open = false;
+  }
+  ImGui::SetNextWindowSize(ImVec2(520, 0), ImGuiCond_Appearing);
+  if (ImGui::BeginPopupModal("Pipeline Loaded with Warnings", nullptr,
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings)) {
+    ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + ImGui::GetContentRegionAvail().x);
+    ImGui::TextUnformatted(g_state.load_warnings_text.c_str());
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+    float bw = 120.0f;
+    ImGui::SetCursorPosX(ImGui::GetContentRegionAvail().x - bw + ImGui::GetCursorPosX());
+    if (ImGui::Button("OK", ImVec2(bw, 0))) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+  }
+}
+
+// Three-button unsaved-changes confirm modal: Save / Don't Save / Cancel.
+// Mirrors desktop-app behaviour — the user has three distinct intents:
+//   Save        — write the current graph to disk, then proceed with the action
+//   Don't Save  — discard changes, proceed with the action
+//   Cancel      — abort the action, return to editing
+void draw_unsaved_confirm_modal() {
+  static bool should_open = false;
+  if (g_state.unsaved_pending != AppState::pending_action::none) {
+    // Only open when a real pending action exists AND a modal isn't already
+    // showing (re-entry guard). We detect the latter by tracking the previous
+    // state through the should_open latch.
+    if (!should_open) should_open = true;
+  }
+  if (should_open && g_state.unsaved_pending != AppState::pending_action::none) {
+    ImGui::OpenPopup("Unsaved Changes");
+    should_open = false;
+  }
+  ImGui::SetNextWindowSize(ImVec2(440, 0), ImGuiCond_Appearing);
+  if (ImGui::BeginPopupModal("Unsaved Changes", nullptr,
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings)) {
+    ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + ImGui::GetContentRegionAvail().x);
+    ImGui::TextUnformatted(
+        "The current pipeline has unsaved changes.\n"
+        "Save before proceeding?");
+    ImGui::PopTextWrapPos();
+    ImGui::Spacing();
+    float bw = 110.0f;
+    float total = bw * 3 + ImGui::GetStyle().ItemSpacing.x * 2;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::GetContentRegionAvail().x - total) * 0.5f);
+    auto action = g_state.unsaved_pending;
+    if (ImGui::Button("Save", ImVec2(bw, 0))) {
+      g_state.unsaved_pending = AppState::pending_action::none;
+      ImGui::CloseCurrentPopup();
+      // If we already have a path, save in place; otherwise the Save as
+      // dialog takes over and the user can cancel there without losing the
+      // pending action — but the simplest correct behaviour is: save-as
+      // opens, the user picks a path, and after successful save we re-fire
+      // the original action.
+      if (!g_state.pipeline_path.empty()) {
+        if (do_save_pipeline(g_state.pipeline_path)) {
+          g_state.unsaved_pending = action;
+          execute_pending_action();
+        }
+      } else {
+        // Defer the action until after Save as completes. We rely on the
+        // Save-as poll handler not touching unsaved_pending, so it stays
+        // = none here; we re-arm by remembering the action locally.
+        // To keep the round-trip simple, we cancel: the user can press
+        // New/Open again after Save-as finishes. Trade-off documented.
+        request_save_as_dialog();
+      }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Don't Save", ImVec2(bw, 0))) {
+      ImGui::CloseCurrentPopup();
+      execute_pending_action();  // pending is still set, dispatch + clear
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(bw, 0))) {
+      g_state.unsaved_pending = AppState::pending_action::none;
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
   }
 }
 
@@ -1481,7 +1960,13 @@ int main() {
     draw_main_menu(docking);
   };
   params.callbacks.ShowStatus = []() { draw_status_bar(); };
-  params.callbacks.ShowGui    = []() { draw_about_popup(); };
+  params.callbacks.ShowGui    = []() {
+    process_global_hotkeys();
+    draw_about_popup();
+    draw_load_error_modal();
+    draw_load_warnings_modal();
+    draw_unsaved_confirm_modal();
+  };
 
   // Bottom dock for View + Logger (~40%).
   {

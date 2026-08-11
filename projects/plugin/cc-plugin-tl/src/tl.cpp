@@ -79,6 +79,9 @@ class ast_out_slot final : public slot {
 // ---------------------------------------------------------------------------
 class frontend_node final : public node {
  public:
+  frontend_node() : id_(fresh_instance_id("tl.frontend")) {}
+  explicit frontend_node(std::string id) : id_(std::move(id)) {}
+
   auto type_id()     const -> std::string_view override { return "tl.frontend"; }
   auto instance_id() const -> std::string_view override { return id_; }
 
@@ -126,7 +129,7 @@ class frontend_node final : public node {
   }
 
  private:
-  std::string id_{fresh_instance_id("tl.frontend")};
+  std::string id_;
   props       props_;
 };
 
@@ -138,6 +141,10 @@ class frontend_factory final : public node_factory {
 
   auto create() const -> std::unique_ptr<node> override {
     return std::make_unique<frontend_node>();
+  }
+  auto create_with_id(std::string_view instance_id) const
+      -> std::unique_ptr<node> override {
+    return std::make_unique<frontend_node>(std::string{instance_id});
   }
 };
 

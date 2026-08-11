@@ -1,14 +1,16 @@
 project(cc-workbench VERSION 0.1.0.0 LANGUAGES CXX)
 
 find_package(imgui_bundle REQUIRED)
+find_package(pugixml REQUIRED)
 
 cc_add_executable(${PROJECT_NAME}
   SOURCES
     src/main.cpp
+    src/pipeline_xml.cpp
     ne/builders.cpp
     ne/drawing.cpp
     ne/widgets.cpp
-  PRIVATE_DEPS cc-runtime::cc-runtime cc-astit::cc-astit cc-ir::cc-ir imgui_bundle
+  PRIVATE_DEPS cc-runtime::cc-runtime cc-astit::cc-astit cc-ir::cc-ir imgui_bundle pugixml::pugixml
 )
 target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 

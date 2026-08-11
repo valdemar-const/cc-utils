@@ -29,11 +29,14 @@
 #include "ne/widgets.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <optional>
+#include <thread>
 #include <map>
 #include <memory>
 #include <string>
@@ -163,12 +166,18 @@ struct AppState {
   bool        canvas_navigate_content = false;
 
   // View tab cache. Pulling is expensive (Exec spawns a child, Assemble runs
-  // nasm+ld, ...) and doing it every frame freezes the UI. Pull happens only
-  // when the user clicks Refresh or switches the selected view node.
+  // nasm+ld, ...) and doing it synchronously in the UI thread would freeze
+  // the host. Instead, pull runs in a background std::async; the UI polls
+  // its status every frame and renders whatever the cache last held.
   std::string                  view_cached_for;
   std::optional<cc::any_value> view_cached_value;
   std::string                  view_cached_error;
   std::string                  view_cached_type_name;
+  bool                         view_cache_stale     = true;   // invalidation flag
+  // Background pull state.
+  std::future<std::pair<std::string, std::optional<cc::any_value>>> view_pull_future;
+  std::string                  view_pull_target;               // node being pulled
+  bool                         view_pull_running   = false;
 
   // Fonts
   ImFont* ui_font   = nullptr;
@@ -228,9 +237,10 @@ ed::EditorContext* g_editor = nullptr;
 noop_view_context g_view_ctx;
 
 // Drop the View-tab cache after any graph mutation. Cheap; called from every
-// node/edge/property change site. The next draw_view_window() will re-pull.
+// node/edge/property change site. Marks cache stale (Refresh button will show
+// "*"); the user re-pulls explicitly so the host UI never auto-blocks.
 inline void invalidate_view_cache() {
-  g_state.view_cached_for.clear();
+  g_state.view_cache_stale = true;
 }
 
 void log(std::string msg) {
@@ -727,14 +737,22 @@ void draw_pipeline_canvas() {
   // These commands mutate the graph or the editor view — they belong to the
   // Pipeline tab, not the global menu. Navigate-style buttons set a flag
   // consumed inside ed::Begin/End below, where an editor context is current.
+  const bool busy = g_state.view_pull_running;  // freeze UI mutations during pull
+  if (busy) ImGui::BeginDisabled();
   if (ImGui::Button("Run"))           run_pipeline();
   ImGui::SameLine();
   if (ImGui::Button("Zoom to Fit"))   g_state.canvas_navigate_content = true;
   ImGui::SameLine();
   if (ImGui::Button("Clear"))         clear_graph();
+  if (busy) ImGui::EndDisabled();
   ImGui::SameLine();
-  ImGui::TextDisabled("|  nodes: %zu   edges: %zu",
-                      g_state.g.nodes().size(), g_state.g.edges().size());
+  if (busy) {
+    ImGui::TextDisabled("|  COMPUTING: %s ...",
+                        g_state.view_pull_target.c_str());
+  } else {
+    ImGui::TextDisabled("|  nodes: %zu   edges: %zu",
+                        g_state.g.nodes().size(), g_state.g.edges().size());
+  }
   ImGui::Separator();
 
   ed::SetCurrentEditor(g_editor);
@@ -968,43 +986,76 @@ void draw_view_window() {
   if (ImGui::Combo("##view_select", &current_idx, getter, &views,
                    static_cast<int>(views.size()))) {
     g_state.view_selected = views[current_idx].instance;
-    // Selection changed → drop stale cache so the next refresh pulls fresh.
-    g_state.view_cached_for.clear();
+    invalidate_view_cache();
   }
 
   ImGui::SameLine();
-  // Pull is explicit — automatic per-frame pull would block the UI whenever
-  // the pipeline contains slow nodes (Exec, Assemble, ...).
-  bool need_refresh = (g_state.view_cached_for != g_state.view_selected);
-  if (ImGui::Button("Refresh") || need_refresh) {
-    g_state.view_cached_for = g_state.view_selected;
-    g_state.view_cached_value.reset();
-    g_state.view_cached_error.clear();
-    g_state.view_cached_type_name.clear();
-    cc::runtime::runner r{g_state.g};
-    auto result = r.pull(g_state.view_selected, "in");
-    if (!result) {
-      g_state.view_cached_error = result.error().what;
-    } else {
-      const cc::any_value* v = *result;
-      if (!v || !v->has_value()) {
-        g_state.view_cached_error =
-            "(no value — connect a Source output to this View node)";
+
+  // If a background pull is running, poll its status. Otherwise offer Refresh.
+  if (g_state.view_pull_running) {
+    using namespace std::chrono_literals;
+    if (g_state.view_pull_future.wait_for(0s) == std::future_status::ready) {
+      auto [error_or_type, value_opt] = g_state.view_pull_future.get();
+      g_state.view_pull_running = false;
+      g_state.view_cached_for    = g_state.view_pull_target;
+      g_state.view_cache_stale   = false;
+      if (!error_or_type.empty()) {
+        // First slot of the pair carries the error message on failure.
+        g_state.view_cached_error = std::move(error_or_type);
+        g_state.view_cached_value.reset();
       } else {
-        g_state.view_cached_value = *v;
-        g_state.view_cached_type_name =
-            std::string{g_state.host->types().name_of(v->type_descriptor())};
+        g_state.view_cached_error.clear();
+        g_state.view_cached_value = std::move(value_opt);
       }
     }
   }
 
+  const bool can_refresh = !g_state.view_pull_running;
+  const char* label = g_state.view_pull_running
+                          ? "Working..."
+                          : (g_state.view_cache_stale ? "Refresh*" : "Refresh");
+  if (!can_refresh) { ImGui::BeginDisabled(); }
+  if (ImGui::Button(label) && can_refresh) {
+    // Snapshot the graph by value would be ideal; for MVP we trust the user
+    // does not mutate the graph between Refresh and pull completion. Run the
+    // pull on a worker thread so the host UI stays responsive.
+    g_state.view_pull_target  = g_state.view_selected;
+    g_state.view_pull_running = true;
+    g_state.view_cached_error.clear();
+    std::string target = g_state.view_selected;
+    g_state.view_pull_future = std::async(
+        std::launch::async,
+        [target]() -> std::pair<std::string, std::optional<cc::any_value>> {
+          cc::runtime::runner r{g_state.g};
+          auto result = r.pull(target, "in");
+          if (!result) {
+            return {result.error().what, std::nullopt};
+          }
+          const cc::any_value* v = *result;
+          if (!v || !v->has_value()) {
+            return {std::string{"(no value — input is empty)"}, std::nullopt};
+          }
+          // any_value is copyable (aa::copy) — copy into the optional.
+          return {std::string{}, std::optional<cc::any_value>{*v}};
+        });
+  }
+  if (!can_refresh) { ImGui::EndDisabled(); }
+
   ImGui::SameLine();
-  ImGui::TextDisabled("(pull on demand)");
+  if (g_state.view_pull_running) {
+    ImGui::TextDisabled("(pulling %s ...)", g_state.view_pull_target.c_str());
+  } else if (g_state.view_cache_stale && !g_state.view_cached_for.empty()) {
+    ImGui::TextDisabled("(stale — click Refresh)");
+  } else {
+    ImGui::TextDisabled("(pull on demand)");
+  }
 
   ImGui::Separator();
 
   if (!g_state.view_cached_error.empty()) {
-    ImGui::TextDisabled("%s", g_state.view_cached_error.c_str());
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.50f, 0.40f, 1.0f));
+    ImGui::TextWrapped("error: %s", g_state.view_cached_error.c_str());
+    ImGui::PopStyleColor();
     return;
   }
   if (!g_state.view_cached_value.has_value()) {

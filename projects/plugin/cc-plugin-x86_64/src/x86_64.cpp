@@ -21,8 +21,9 @@
 #include <cc/ir.hpp>   // cc::ir::module
 
 #include <atomic>
-#include <cstdio>      // std::remove
-#include <cstdlib>     // std::system
+#include <cstdio>       // std::remove
+#include <cstdlib>      // std::system
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <span>
@@ -84,7 +85,7 @@ class text_out_slot final : public slot {
 class exe_out_slot final : public slot {
  public:
   auto id()   const -> std::string_view  override { return "exe"; }
-  auto type() const -> type_descriptor_t override { return descriptor_of<std::string>; }
+  auto type() const -> type_descriptor_t override { return descriptor_of<std::filesystem::path>; }
   auto dir()  const -> slot_dir          override { return slot_dir::out; }
   auto card() const -> slot_card         override { return slot_card::single; }
 };
@@ -177,31 +178,34 @@ class assemble_node final : public node {
       return std::unexpected(failure{"'asm' input not connected or wrong type"});
     }
 
-    std::string exe{props_.get("out_path")};
-    if (exe.empty()) {
+    std::string raw_out{props_.get("out_path")};
+    if (raw_out.empty()) {
       return std::unexpected(failure{"'out_path' property not set"});
     }
-    const std::string asm_path = exe + ".asm";
-    const std::string obj_path = exe + ".o";
+    std::filesystem::path exe(raw_out);
+    std::filesystem::path asm_path = exe;
+    asm_path += ".asm";
+    std::filesystem::path obj_path = exe;
+    obj_path += ".o";
 
     {
       std::ofstream os{asm_path};
       if (!os) {
-        return std::unexpected(failure{"cannot write '" + asm_path + "'"});
+        return std::unexpected(failure{"cannot write '" + asm_path.string() + "'"});
       }
       os << *asm_text;
     }
-    if (std::system(("nasm -f elf64 " + asm_path + " -o " + obj_path).c_str()) != 0) {
-      std::remove(asm_path.c_str());
+    if (std::system(("nasm -f elf64 " + asm_path.string() + " -o " + obj_path.string()).c_str()) != 0) {
+      std::remove(asm_path.string().c_str());
       return std::unexpected(failure{"nasm failed (see console)"});
     }
-    if (std::system(("ld " + obj_path + " -o " + exe).c_str()) != 0) {
-      std::remove(asm_path.c_str());
-      std::remove(obj_path.c_str());
+    if (std::system(("ld " + obj_path.string() + " -o " + exe.string()).c_str()) != 0) {
+      std::remove(asm_path.string().c_str());
+      std::remove(obj_path.string().c_str());
       return std::unexpected(failure{"ld failed (see console)"});
     }
-    std::remove(asm_path.c_str());
-    std::remove(obj_path.c_str());
+    std::remove(asm_path.string().c_str());
+    std::remove(obj_path.string().c_str());
 
     for (auto& [slot_id, out] : outputs) {
       if (slot_id == "exe") {

@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstdlib>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
@@ -91,13 +92,17 @@ auto hash_color(std::string_view s) -> ImVec4 {
 
 auto pin_color_for_type(std::string_view type_name) -> ImVec4 {
   static const std::unordered_map<std::string_view, ImVec4> known = {
-    {"text",  ImVec4(0.35f, 0.60f, 0.95f, 1.0f)},
-    {"ast",   ImVec4(0.62f, 0.40f, 0.78f, 1.0f)},
-    {"ast.tl",ImVec4(0.62f, 0.40f, 0.78f, 1.0f)},
-    {"ir",    ImVec4(0.35f, 0.80f, 0.45f, 1.0f)},
-    {"bytes", ImVec4(0.95f, 0.60f, 0.25f, 1.0f)},
-    {"any",   ImVec4(0.55f, 0.55f, 0.55f, 1.0f)},
-    {"",      ImVec4(0.55f, 0.55f, 0.55f, 1.0f)},  // wildcard / unset
+    {"text",     ImVec4(0.35f, 0.60f, 0.95f, 1.0f)},
+    {"path",     ImVec4(0.95f, 0.78f, 0.30f, 1.0f)},  // filesystem path — gold
+    {"int",      ImVec4(0.25f, 0.85f, 0.85f, 1.0f)},  // integer return code — cyan
+    {"ast",      ImVec4(0.62f, 0.40f, 0.78f, 1.0f)},
+    {"ast.tl",   ImVec4(0.62f, 0.40f, 0.78f, 1.0f)},
+    {"ir",       ImVec4(0.35f, 0.80f, 0.45f, 1.0f)},
+    {"ir.module",ImVec4(0.35f, 0.80f, 0.45f, 1.0f)},
+    {"tl.ast",   ImVec4(0.62f, 0.40f, 0.78f, 1.0f)},
+    {"bytes",    ImVec4(0.95f, 0.60f, 0.25f, 1.0f)},
+    {"any",      ImVec4(0.55f, 0.55f, 0.55f, 1.0f)},
+    {"",         ImVec4(0.55f, 0.55f, 0.55f, 1.0f)},  // wildcard / unset
   };
   if (auto it = known.find(type_name); it != known.end()) return it->second;
   return hash_color(type_name);
@@ -105,6 +110,8 @@ auto pin_color_for_type(std::string_view type_name) -> ImVec4 {
 
 auto icon_for_type(std::string_view type_name) -> IconType {
   if (type_name == "text")  return IconType::Circle;
+  if (type_name == "path")  return IconType::Diamond;
+  if (type_name == "int")   return IconType::Circle;
   if (type_name == "bytes") return IconType::Diamond;
   if (type_name == "any" || type_name.empty()) return IconType::Grid;
   return IconType::Square;  // structured (ast/ir/...)
@@ -677,14 +684,15 @@ void run_pipeline() {
     log("run: producer returned empty value");
     return;
   }
-  const auto* exe_path = aa::any_cast<std::string>(out);
+  const auto* exe_path = aa::any_cast<std::filesystem::path>(out);
   if (!exe_path) {
-    log("run: 'exe' output is not a string path");
+    log("run: 'exe' output is not a path");
     return;
   }
-  log("run: built " + *exe_path);
-  if (std::system(("chmod +x " + *exe_path).c_str()) == 0) {
-    log("run: chmod +x ok — binary ready at " + *exe_path);
+  const std::string exe_str = exe_path->string();
+  log("run: built " + exe_str);
+  if (std::system(("chmod +x " + exe_str).c_str()) == 0) {
+    log("run: chmod +x ok — binary ready at " + exe_str);
   } else {
     log("run: warning, chmod returned non-zero");
   }

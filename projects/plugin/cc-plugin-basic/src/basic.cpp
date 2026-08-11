@@ -1,11 +1,15 @@
 // cc-plugin-basic — basic node plugin (no UI).
 //
-// Registers the "text" value type and two nodes:
-//   - text.from_file: output slot "out" (text), property "path". Reads a file.
-//   - view:           input slot "in" (any, multi), property "name". Debug tap.
+// Registers:
+//   wire types: text (std::string), path (std::filesystem::path), int (long)
+//   nodes:
+//     - text.from_file: reads file content from a "path" property → outputs text
+//     - view:           debug tap, accepts any value
+//     - exec:           runs an executable, returns ret_code/cout/cerr
 //
-// No view renderer here — renderers are UI code and live host-side (cc-workbench
-// registers a text renderer for the "text" type at startup).
+// exec is implemented via boost::process v2 + boost::asio so it is
+// cross-platform (Linux/macOS/Windows). std::filesystem::path is used for
+// every filesystem location — no platform-specific path encoding.
 
 #include "cc/any_value.hpp"
 #include "cc/host.hpp"
@@ -13,9 +17,20 @@
 #include "cc/node_factory.hpp"
 #include "cc/plugin_entry.hpp"
 
+#include <boost/asio/buffer.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/readable_pipe.hpp>
+#include <boost/process/v2/process.hpp>
+#include <boost/process/v2/shell.hpp>
+#include <boost/process/v2/stdio.hpp>
+#include <boost/system/error_code.hpp>
+
 #include <atomic>
+#include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -48,7 +63,7 @@ class props final : public node_properties {
 };
 
 // ---------------------------------------------------------------------------
-// Slots
+// Slots — reused across nodes where the wire type matches.
 // ---------------------------------------------------------------------------
 class text_out_slot final : public slot {
  public:
@@ -84,13 +99,14 @@ class from_file_node final : public node {
 
   auto activate(std::span<const input_pair>,
                 std::span<output_pair>      outputs) -> activate_result override {
-    std::string path{props_.get("path")};
-    if (path.empty()) {
+    std::string raw{props_.get("path")};
+    if (raw.empty()) {
       return std::unexpected(failure{"'path' not set"});
     }
+    std::filesystem::path path(raw);
     std::ifstream in(path);
     if (!in) {
-      return std::unexpected(failure{"cannot open '" + path + "'"});
+      return std::unexpected(failure{"cannot open '" + path.string() + "'"});
     }
     std::ostringstream ss;
     ss << in.rdbuf();
@@ -180,6 +196,192 @@ class view_factory final : public node_factory {
   }
 };
 
+// ---------------------------------------------------------------------------
+// exec node — runs an executable, exposes ret_code / cout / cerr as wires.
+//
+//   inputs:  exe (path), args (text)
+//   outputs: ret_code (long), cout (text), cerr (text)
+//   property: merge_stderr (bool, default false) — analogous to `2>&1`
+//
+// Cross-platform via boost::process v2: spawn + std_out/std_err > pipes, drive
+// async reads on an io_context, wait for exit, harvest exit code. On POSIX
+// the default launcher forks+execs; on Windows it uses CreateProcess.
+// ---------------------------------------------------------------------------
+namespace proc = boost::process::v2;
+namespace asio = boost::asio;
+
+class path_in_exe_slot final : public slot {
+ public:
+  auto id()   const -> std::string_view  override { return "exe"; }
+  auto type() const -> type_descriptor_t override { return descriptor_of<std::filesystem::path>; }
+  auto dir()  const -> slot_dir          override { return slot_dir::in; }
+  auto card() const -> slot_card         override { return slot_card::single; }
+};
+
+class text_in_args_slot final : public slot {
+ public:
+  auto id()   const -> std::string_view  override { return "args"; }
+  auto type() const -> type_descriptor_t override { return descriptor_of<std::string>; }
+  auto dir()  const -> slot_dir          override { return slot_dir::in; }
+  auto card() const -> slot_card         override { return slot_card::single; }
+};
+
+class long_out_slot final : public slot {
+ public:
+  auto id()   const -> std::string_view  override { return "ret_code"; }
+  auto type() const -> type_descriptor_t override { return descriptor_of<long>; }
+  auto dir()  const -> slot_dir          override { return slot_dir::out; }
+  auto card() const -> slot_card         override { return slot_card::single; }
+};
+
+class text_out_cout_slot final : public slot {
+ public:
+  auto id()   const -> std::string_view  override { return "cout"; }
+  auto type() const -> type_descriptor_t override { return descriptor_of<std::string>; }
+  auto dir()  const -> slot_dir          override { return slot_dir::out; }
+  auto card() const -> slot_card         override { return slot_card::single; }
+};
+
+class text_out_cerr_slot final : public slot {
+ public:
+  auto id()   const -> std::string_view  override { return "cerr"; }
+  auto type() const -> type_descriptor_t override { return descriptor_of<std::string>; }
+  auto dir()  const -> slot_dir          override { return slot_dir::out; }
+  auto card() const -> slot_card         override { return slot_card::single; }
+};
+
+class exec_node final : public node {
+ public:
+  auto type_id()     const -> std::string_view override { return "basic.exec"; }
+  auto instance_id() const -> std::string_view override { return id_; }
+
+  auto slots() const -> std::span<slot const* const> override {
+    static const path_in_exe_slot   s_exe{};
+    static const text_in_args_slot  s_args{};
+    static const long_out_slot      s_ret{};
+    static const text_out_cout_slot s_cout{};
+    static const text_out_cerr_slot s_cerr{};
+    static constexpr slot const* arr[] = {&s_exe, &s_args, &s_ret, &s_cout, &s_cerr};
+    return arr;
+  }
+
+  auto properties() -> node_properties& override { return props_; }
+
+  auto activate(std::span<const input_pair>  inputs,
+                std::span<output_pair>       outputs) -> activate_result override {
+    const std::filesystem::path* exe_p = nullptr;
+    const std::string* args_s = nullptr;
+    for (auto [slot_id, value] : inputs) {
+      if (slot_id == "exe"  && value) exe_p  = aa::any_cast<std::filesystem::path>(value);
+      if (slot_id == "args" && value) args_s = aa::any_cast<std::string>(value);
+    }
+    if (!exe_p || exe_p->empty()) {
+      return std::unexpected(failure{"'exe' input not connected or empty"});
+    }
+
+    // Build a shell command line: "<exe> <args>". proc::shell parses this
+    // cross-platform (POSIX word-split / Windows CommandLineToArgvW) and
+    // resolves the executable in PATH via proc::shell::exe().
+    std::string cmd = exe_p->string();
+    if (args_s && !args_s->empty()) {
+      cmd += " ";
+      cmd += *args_s;
+    }
+    proc::shell sh(cmd);
+    if (sh.empty()) {
+      return std::unexpected(failure{"empty command line"});
+    }
+    auto exe_resolved = sh.exe();
+    if (exe_resolved.empty()) {
+      exe_resolved = *exe_p;  // fall back to literal path
+    }
+
+    const bool merge = props_.get("merge_stderr") == "true"
+                       || props_.get("merge_stderr") == "1";
+
+    boost::system::error_code ec;
+    asio::io_context ctx;
+    asio::readable_pipe out_pipe(ctx);
+    asio::readable_pipe err_pipe(ctx);
+
+    // v2 in boost 1.90 uses a single process_stdio initializer with three
+    // fields (in/out/err). For merge_stderr we route both out and err to
+    // the same readable_pipe.
+    proc::process_stdio stdio;
+    stdio.out = out_pipe;
+    if (merge) {
+      stdio.err = out_pipe;
+    } else {
+      stdio.err = err_pipe;
+    }
+
+    proc::process child(ctx, exe_resolved, sh.args(), stdio, ec);
+    if (ec) {
+      return std::unexpected(failure{"spawn failed: " + ec.message()});
+    }
+
+    // Drain both pipes asynchronously. ctx.run() returns when both hit EOF
+    // (child exited, write ends closed).
+    std::string out, err;
+    char out_buf[4096], err_buf[4096];
+    std::function<void()> read_out, read_err;
+
+    read_out = [&]() {
+      out_pipe.async_read_some(asio::buffer(out_buf),
+        [&](boost::system::error_code r_ec, std::size_t n) {
+          if (n > 0) out.append(out_buf, n);
+          if (!r_ec) read_out();  // continue until EOF
+        });
+    };
+    read_err = [&]() {
+      err_pipe.async_read_some(asio::buffer(err_buf),
+        [&](boost::system::error_code r_ec, std::size_t n) {
+          if (n > 0) err.append(err_buf, n);
+          if (!r_ec) read_err();
+        });
+    };
+
+    read_out();
+    if (!merge) read_err();
+    ctx.run();
+    child.wait();
+    long code = child.exit_code();
+
+    for (auto& [slot_id, out] : outputs) {
+      if (slot_id == "ret_code") *out = code;
+      else if (slot_id == "cout") *out = out;
+      else if (slot_id == "cerr") *out = err;
+    }
+    return {};
+  }
+
+ private:
+  std::string id_{fresh_instance_id("basic.exec")};
+  props       props_;
+};
+
+class exec_factory final : public node_factory {
+ public:
+  auto type_id()      const -> std::string_view override { return "basic.exec"; }
+  auto display_name() const -> std::string_view override { return "Exec"; }
+  auto category()     const -> std::string_view override { return "Basic"; }
+
+  auto property_schema() const -> std::span<const property_desc> override {
+    static constexpr property_desc schema[] = {
+      {"merge_stderr", "Merge stderr into stdout (2>&1)", property_kind::boolean, "false"},
+    };
+    return schema;
+  }
+
+  auto create() const -> std::unique_ptr<node> override {
+    auto n = std::make_unique<exec_node>();
+    for (auto const& d : property_schema()) {
+      n->properties().set(d.key, d.default_value);
+    }
+    return n;
+  }
+};
+
 }  // namespace
 
 }  // namespace cc::basic
@@ -194,6 +396,9 @@ extern "C" cc::plugin_info cc_plugin_load() {
 
 extern "C" void cc_plugin_register(cc::host_registry& r) {
   r.types().register_value_type<std::string>("text");
+  r.types().register_value_type<std::filesystem::path>("path");
+  r.types().register_value_type<long>("int");
   r.register_node_factory(std::make_unique<cc::basic::from_file_factory>());
   r.register_node_factory(std::make_unique<cc::basic::view_factory>());
+  r.register_node_factory(std::make_unique<cc::basic::exec_factory>());
 }

@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <map>
 #include <memory>
 #include <string>
@@ -161,6 +162,14 @@ struct AppState {
   bool        about_open          = false;
   bool        canvas_navigate_content = false;
 
+  // View tab cache. Pulling is expensive (Exec spawns a child, Assemble runs
+  // nasm+ld, ...) and doing it every frame freezes the UI. Pull happens only
+  // when the user clicks Refresh or switches the selected view node.
+  std::string                  view_cached_for;
+  std::optional<cc::any_value> view_cached_value;
+  std::string                  view_cached_error;
+  std::string                  view_cached_type_name;
+
   // Fonts
   ImFont* ui_font   = nullptr;
   ImFont* mono_font = nullptr;
@@ -217,6 +226,12 @@ AppState g_state;
 log_view g_log;
 ed::EditorContext* g_editor = nullptr;
 noop_view_context g_view_ctx;
+
+// Drop the View-tab cache after any graph mutation. Cheap; called from every
+// node/edge/property change site. The next draw_view_window() will re-pull.
+inline void invalidate_view_cache() {
+  g_state.view_cached_for.clear();
+}
 
 void log(std::string msg) {
   g_log.append(msg);
@@ -397,6 +412,7 @@ void poll_file_dialog() {
       auto* n = g_state.g.find_node(g_state.file_dialog_target.instance);
       if (n) {
         n->properties().set(g_state.file_dialog_target.key, path);
+        invalidate_view_cache();
         log("set " + g_state.file_dialog_target.key + " = " + path +
             " on " + g_state.file_dialog_target.instance);
       }
@@ -422,6 +438,7 @@ void draw_property_widget(cc::node& n, const cc::property_desc& desc) {
       ImGui::SetNextItemWidth(180);
       if (ImGui::InputText("##v", buf, sizeof(buf))) {
         n.properties().set(desc.key, buf);
+        invalidate_view_cache();
       }
       ImGui::SameLine();
       if (ImGui::SmallButton("...")) {
@@ -437,8 +454,10 @@ void draw_property_widget(cc::node& n, const cc::property_desc& desc) {
       char buf[4096];
       std::strncpy(buf, current.c_str(), sizeof(buf) - 1);
       buf[sizeof(buf) - 1] = 0;
-      ImGui::InputTextMultiline("##v", buf, sizeof(buf), ImVec2(220, 80));
-      n.properties().set(desc.key, buf);
+      if (ImGui::InputTextMultiline("##v", buf, sizeof(buf), ImVec2(220, 80))) {
+        n.properties().set(desc.key, buf);
+        invalidate_view_cache();
+      }
       break;
     }
     case cc::property_kind::integer: {
@@ -449,6 +468,7 @@ void draw_property_widget(cc::node& n, const cc::property_desc& desc) {
       ImGui::SetNextItemWidth(120);
       if (ImGui::InputInt("##v", &v, 1, 100)) {
         n.properties().set(desc.key, std::to_string(v));
+        invalidate_view_cache();
       }
       break;
     }
@@ -456,6 +476,7 @@ void draw_property_widget(cc::node& n, const cc::property_desc& desc) {
       bool v = (current == "1" || current == "true");
       if (ImGui::Checkbox(desc.display_name.data(), &v)) {
         n.properties().set(desc.key, v ? "1" : "0");
+        invalidate_view_cache();
       }
       break;
     }
@@ -469,6 +490,7 @@ void draw_property_widget(cc::node& n, const cc::property_desc& desc) {
       ImGui::SetNextItemWidth(180);
       if (ImGui::InputText("##v", buf, sizeof(buf))) {
         n.properties().set(desc.key, buf);
+        invalidate_view_cache();
       }
       break;
     }
@@ -545,6 +567,7 @@ void draw_create_menu() {
           std::string instance{node->instance_id()};
           int ed_id = editor_id_for(instance);
           g_state.g.add_node(std::move(node));
+          invalidate_view_cache();
           // Position is applied next frame inside ed::Begin/End —
           // ed::SetNodePosition takes canvas-local coords.
           g_state.pending_positions.push_back({ed_id, g_create_menu.canvas_pos});
@@ -653,6 +676,7 @@ void clear_graph() {
   g_state.inst2ed.clear();
   g_state.ed2inst.clear();
   g_state.view_selected.clear();
+  invalidate_view_cache();
   log("graph cleared");
 }
 
@@ -808,6 +832,7 @@ void draw_pipeline_canvas() {
             std::string{out_n->instance_id()}, std::string{out_s->id()},
             std::string{in_n->instance_id()},  std::string{in_s->id()}};
         g_state.g.add_edge(std::move(e));
+        invalidate_view_cache();
         log("linked " + std::string{out_s->id()} + " → " + std::string{in_s->id()});
       }
     }
@@ -826,9 +851,10 @@ void draw_pipeline_canvas() {
           g_state.g.remove_edges_of(instance);
           g_state.g.remove_node(instance);
           if (g_state.view_selected == instance) g_state.view_selected.clear();
-          g_state.inst2ed.erase(instance);
-          g_state.ed2inst.erase(it);
-          log("deleted node " + instance);
+            g_state.inst2ed.erase(instance);
+            g_state.ed2inst.erase(it);
+            invalidate_view_cache();
+            log("deleted node " + instance);
         }
       }
     }
@@ -841,6 +867,7 @@ void draw_pipeline_canvas() {
             std::string src = e.src_node, src_s = e.src_slot;
             std::string dst = e.dst_node, dst_s = e.dst_slot;
             g_state.g.remove_edge(src, src_s, dst, dst_s);
+            invalidate_view_cache();
             log("deleted link " + src_s + " → " + dst_s);
             break;
           }
@@ -941,35 +968,59 @@ void draw_view_window() {
   if (ImGui::Combo("##view_select", &current_idx, getter, &views,
                    static_cast<int>(views.size()))) {
     g_state.view_selected = views[current_idx].instance;
+    // Selection changed → drop stale cache so the next refresh pulls fresh.
+    g_state.view_cached_for.clear();
   }
 
   ImGui::SameLine();
-  ImGui::TextDisabled("(pulled every frame)");
+  // Pull is explicit — automatic per-frame pull would block the UI whenever
+  // the pipeline contains slow nodes (Exec, Assemble, ...).
+  bool need_refresh = (g_state.view_cached_for != g_state.view_selected);
+  if (ImGui::Button("Refresh") || need_refresh) {
+    g_state.view_cached_for = g_state.view_selected;
+    g_state.view_cached_value.reset();
+    g_state.view_cached_error.clear();
+    g_state.view_cached_type_name.clear();
+    cc::runtime::runner r{g_state.g};
+    auto result = r.pull(g_state.view_selected, "in");
+    if (!result) {
+      g_state.view_cached_error = result.error().what;
+    } else {
+      const cc::any_value* v = *result;
+      if (!v || !v->has_value()) {
+        g_state.view_cached_error =
+            "(no value — connect a Source output to this View node)";
+      } else {
+        g_state.view_cached_value = *v;
+        g_state.view_cached_type_name =
+            std::string{g_state.host->types().name_of(v->type_descriptor())};
+      }
+    }
+  }
+
+  ImGui::SameLine();
+  ImGui::TextDisabled("(pull on demand)");
 
   ImGui::Separator();
 
-  cc::runtime::runner r{g_state.g};
-  auto result = r.pull(g_state.view_selected, "in");
-  if (!result) {
-    ImGui::TextDisabled("error: %s", result.error().what.c_str());
+  if (!g_state.view_cached_error.empty()) {
+    ImGui::TextDisabled("%s", g_state.view_cached_error.c_str());
     return;
   }
-  const cc::any_value* value = *result;
-  if (!value || !value->has_value()) {
-    ImGui::TextDisabled("(no value — connect a Source output to this View node)");
+  if (!g_state.view_cached_value.has_value()) {
+    ImGui::TextDisabled("(no value yet — click Refresh)");
     return;
   }
 
-  auto type_desc = value->type_descriptor();
+  auto type_desc = g_state.view_cached_value->type_descriptor();
   auto* renderer = g_state.host->renderers().get_for_type(type_desc);
   if (!renderer) {
-    auto name = g_state.host->types().name_of(type_desc);
-    ImGui::TextDisabled("(no renderer registered for type '%.*s')",
-                        static_cast<int>(name.size()), name.data());
+    ImGui::TextDisabled("(no renderer registered for type '%s')",
+                        g_state.view_cached_type_name.c_str());
     return;
   }
   static noop_view_context ctx;
-  renderer->render(*value, ctx);
+  renderer->render(*g_state.view_cached_value, ctx);
 }
 
 // ---------------------------------------------------------------------------

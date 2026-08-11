@@ -4,7 +4,8 @@
 
 #include <string_view>
 
-namespace cc {
+namespace cc
+{
 
 // Bumped on any change to the cc-core plugin contract (interfaces in
 // cc/host.hpp, cc/node_factory.hpp, cc/node.hpp, cc/any_value.hpp).
@@ -15,15 +16,16 @@ namespace cc {
 inline constexpr int plugin_api_version = 3;
 
 // Static metadata returned by cc_plugin_load() for cheap scanning.
-struct plugin_info {
-  int          api_version;
-  const char*  name;  // short id, e.g. "tl", "basic", "x86_64"
-  const char*  kind;  // informational: "frontend" | "backend" | "basic" | "io" ...
+struct plugin_info
+{
+    int         api_version;
+    const char *name; // short id, e.g. "tl", "basic", "x86_64"
+    const char *kind; // informational: "frontend" | "backend" | "basic" | "io" ...
 };
 
-class host_registry;  // forward — see cc/host.hpp
+class host_registry; // forward — see cc/host.hpp
 
-}  // namespace cc
+} // namespace cc
 
 // Plugin entry points (extern "C", resolved by the host via dlopen/Boost.DLL).
 //
@@ -34,4 +36,4 @@ class host_registry;  // forward — see cc/host.hpp
 //                        Called once at load time, after a successful version
 //                        check via cc_plugin_load.
 extern "C" cc::plugin_info cc_plugin_load();
-extern "C" void            cc_plugin_register(cc::host_registry& registry);
+extern "C" void            cc_plugin_register(cc::host_registry &registry);

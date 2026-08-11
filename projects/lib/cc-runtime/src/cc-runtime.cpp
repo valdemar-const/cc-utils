@@ -4,6 +4,7 @@
 // implementations (host_registry, type_registry, plugin_loader, graph,
 // runner, map_properties) for hosts (workbench, ccp) and tests.
 
-namespace cc::runtime {
+namespace cc::runtime
+{
 // concrete impls are defined per-feature .cpp files alongside this one.
-}  // namespace cc::runtime
+} // namespace cc::runtime

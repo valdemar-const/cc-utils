@@ -20,14 +20,16 @@
 #include <unordered_map>
 #include <vector>
 
-namespace cc::workbench {
+namespace cc::workbench
+{
 
 // On-disk position in canvas-local pixels. Matches imgui-node-editor's
 // editor-space coordinates (the same space SetNodePosition / GetNodePosition
 // operate in).
-struct pos {
-  float x = 0.0f;
-  float y = 0.0f;
+struct pos
+{
+    float x = 0.0f;
+    float y = 0.0f;
 };
 
 // Format version. Bumped whenever the schema changes in a backward-
@@ -38,16 +40,18 @@ inline constexpr int k_pipeline_format_version = 1;
 // Soft warnings produced while loading — the graph is still usable, but the
 // user should be told something is off (e.g. a required plugin is missing and
 // nodes of that plugin were skipped).
-struct load_warnings {
-  std::vector<std::string> missing_plugins;       // declared in <requires>, not loaded
-  std::vector<std::string> unknown_node_types;    // no factory for this type_id
-  std::vector<std::string> skipped_edges;         // reference an unknown instance_id
+struct load_warnings
+{
+    std::vector<std::string> missing_plugins;    // declared in <requires>, not loaded
+    std::vector<std::string> unknown_node_types; // no factory for this type_id
+    std::vector<std::string> skipped_edges;      // reference an unknown instance_id
 };
 
 // Result of a successful load: per-instance positions to restore + warnings.
-struct load_result {
-  std::unordered_map<std::string, pos> positions;
-  load_warnings warnings;
+struct load_result
+{
+    std::unordered_map<std::string, pos> positions;
+    load_warnings                        warnings;
 };
 
 // Write the graph + positions to `path`. Collects the unique set of plugin
@@ -65,10 +69,7 @@ struct load_result {
 // at the storage layer.
 //
 // Returns an error string on I/O / serialisation failure; success is void.
-auto save_pipeline(const host_registry& host,
-                   const runtime::graph& g,
-                   const std::unordered_map<std::string, pos>& positions,
-                   const std::string& path) -> std::expected<void, std::string>;
+auto save_pipeline(const host_registry &host, const runtime::graph &g, const std::unordered_map<std::string, pos> &positions, const std::string &path) -> std::expected<void, std::string>;
 
 // Read a pipeline XML file into `g` (clears it first) and returns the
 // positions to restore + any soft warnings. Hard failures (file missing,
@@ -82,8 +83,6 @@ auto save_pipeline(const host_registry& host,
 // for the rationale. Resolution against the pipeline's directory is the
 // caller's job — typically done by constructing the runner with the right
 // pipeline_dir, which forwards it to every node's activate_context.
-auto load_pipeline(const host_registry& host,
-                   runtime::graph& g,
-                   const std::string& path) -> std::expected<load_result, std::string>;
+auto load_pipeline(const host_registry &host, runtime::graph &g, const std::string &path) -> std::expected<load_result, std::string>;
 
-}  // namespace cc::workbench
+} // namespace cc::workbench

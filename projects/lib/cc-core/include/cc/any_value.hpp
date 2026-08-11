@@ -21,7 +21,8 @@
 #include <anyany/anyany.hpp>
 #include <anyany/type_descriptor.hpp>
 
-namespace cc {
+namespace cc
+{
 
 // The universal pin/wire value type. Copyable + movable + RTTI-enabled.
 using any_value = aa::any_with<aa::move, aa::copy, aa::type_info>;
@@ -31,7 +32,7 @@ using any_value = aa::any_with<aa::move, aa::copy, aa::type_info>;
 using type_descriptor_t = aa::descriptor_t;
 
 // Compile-time descriptor for a known type T.
-template <typename T>
+template<typename T>
 constexpr type_descriptor_t descriptor_of = aa::descriptor_v<T>;
 
-}  // namespace cc
+} // namespace cc

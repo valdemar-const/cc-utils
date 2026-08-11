@@ -7,11 +7,13 @@
 #include <string_view>
 #include <vector>
 
-namespace cc::astit {
+namespace cc::astit
+{
 [[nodiscard]] CC_ASTIT_API std::string_view version() noexcept;
-}  // namespace cc::astit
+} // namespace cc::astit
 
-namespace cc::ast {
+namespace cc::ast
+{
 
 struct visitor;
 
@@ -20,41 +22,59 @@ struct visitor;
 // ir_generator plugin via cc-astq), so they carry default visibility + an
 // out-of-line key function (accept/dtor) to anchor a single shared vtable in
 // libcc-astit.
-struct CC_ASTIT_API node {
-  virtual ~node();
-  virtual void accept(visitor& v) const = 0;
+struct CC_ASTIT_API node
+{
+    virtual ~node();
+    virtual void accept(visitor &v) const = 0;
 };
 
-struct CC_ASTIT_API int_literal : node {
-  std::int64_t value = 0;
-  void accept(visitor& v) const override;
+struct CC_ASTIT_API int_literal : node
+{
+    std::int64_t value = 0;
+    void         accept(visitor &v) const override;
 };
 
-struct CC_ASTIT_API return_stmt : node {
-  std::unique_ptr<node> value;  // owned; points at the expression
-  void accept(visitor& v) const override;
+struct CC_ASTIT_API return_stmt : node
+{
+    std::unique_ptr<node> value; // owned; points at the expression
+    void                  accept(visitor &v) const override;
 };
 
-struct CC_ASTIT_API program : node {
-  std::vector<std::unique_ptr<node>> body;  // top-level statements, owned
-  void accept(visitor& v) const override;
+struct CC_ASTIT_API program : node
+{
+    std::vector<std::unique_ptr<node>> body; // top-level statements, owned
+    void                               accept(visitor &v) const override;
 };
 
 // Classic double-dispatch visitor. Override only the nodes you care about.
-struct CC_ASTIT_API visitor {
-  virtual ~visitor();
-  virtual void visit(const program&) {}
-  virtual void visit(const return_stmt&) {}
-  virtual void visit(const int_literal&) {}
+struct CC_ASTIT_API visitor
+{
+    virtual ~visitor();
+
+    virtual void
+    visit(const program &)
+    {
+    }
+
+    virtual void
+    visit(const return_stmt &)
+    {
+    }
+
+    virtual void
+    visit(const int_literal &)
+    {
+    }
 };
 
 // Concrete carrier for "tl"-language ASTs. The tl frontend plugin wraps its
 // parsed cc::ast::program here; the tl irgen plugin casts back through
 // shared_ptr<tl_program> (the v3 wire type). Lives in cc-astit so both tl
 // plugins share tl_program's typeinfo across the DSO boundary via AnyAny.
-struct CC_ASTIT_API tl_program {
-  std::unique_ptr<program> root;
-  ~tl_program();
+struct CC_ASTIT_API tl_program
+{
+    std::unique_ptr<program> root;
+    ~tl_program();
 };
 
-}  // namespace cc::ast
+} // namespace cc::ast

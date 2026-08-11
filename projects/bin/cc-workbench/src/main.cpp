@@ -1281,8 +1281,8 @@ void draw_view_window() {
 
   ImGui::SameLine();
 
-  // Trigger a background pull either because the user clicked Refresh or
-  // because the cache has been stale longer than the debounce window.
+  // Trigger a background pull when the cache has been stale longer than the
+  // debounce window.
   auto trigger_pull = [&]() {
     g_state.view_pull_target  = g_state.view_selected;
     g_state.view_pull_running = true;
@@ -1307,8 +1307,9 @@ void draw_view_window() {
         });
   };
 
-  // If a background pull is running, poll its status. Otherwise decide
-  // whether to trigger a new pull (auto-react with debounce, or manual).
+  // If a background pull is running, poll its status. Otherwise, if a view
+  // is selected and the cache has been stale past the debounce window, fire
+  // the next reactive pull.
   if (g_state.view_pull_running) {
     using namespace std::chrono_literals;
     if (g_state.view_pull_future.wait_for(0s) == std::future_status::ready) {
@@ -1327,28 +1328,17 @@ void draw_view_window() {
   } else if (!g_state.view_selected.empty()) {
     // Reactive: if the cache is stale and no pull is running, wait out the
     // debounce window (so rapid edits don't storm pulls) then trigger
-    // automatically. The user can also click Refresh to skip the wait.
+    // automatically. A fresh cache (stale == false) must NOT re-trigger —
+    // otherwise pulls fire every frame, re-spawning exec/assemble each time.
     constexpr auto kDebounce = std::chrono::milliseconds(150);
-    const bool debounce_elapsed =
-        !g_state.view_cache_stale ||
+    const bool should_pull =
+        g_state.view_cache_stale &&
         (std::chrono::steady_clock::now() - g_state.view_stale_since >= kDebounce);
-    if (debounce_elapsed) {
+    if (should_pull) {
       trigger_pull();
     }
   }
 
-  // Manual Refresh button (instant — skips debounce).
-  const bool can_refresh = !g_state.view_pull_running;
-  const char* label = g_state.view_pull_running
-                          ? "Working..."
-                          : (g_state.view_cache_stale ? "Refresh*" : "Refresh");
-  if (!can_refresh) { ImGui::BeginDisabled(); }
-  if (ImGui::Button(label) && can_refresh) {
-    trigger_pull();
-  }
-  if (!can_refresh) { ImGui::EndDisabled(); }
-
-  ImGui::SameLine();
   if (g_state.view_pull_running) {
     ImGui::TextDisabled("(pulling %s ...)", g_state.view_pull_target.c_str());
   } else {
@@ -1364,7 +1354,7 @@ void draw_view_window() {
     return;
   }
   if (!g_state.view_cached_value.has_value()) {
-    ImGui::TextDisabled("(no value yet — click Refresh)");
+    ImGui::TextDisabled("(no value yet — waiting for upstream)");
     return;
   }
 

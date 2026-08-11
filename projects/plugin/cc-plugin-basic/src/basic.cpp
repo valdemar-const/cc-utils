@@ -7,48 +7,32 @@
 //     - view:           debug tap, accepts any value
 //     - exec:           runs an executable, returns ret_code/cout/cerr
 //
-// exec is implemented via boost::process v2 + boost::asio so it is
-// cross-platform (Linux/macOS/Windows). std::filesystem::path is used for
-// every filesystem location — no platform-specific path encoding.
+// exec delegates to cc::basic::executor (see executor.hpp), a platform-tagged
+// runner: raw Win32 CreateProcess on Windows, boost.process v2 on POSIX. The
+// node itself is fully platform-agnostic — it only wires the executor's result
+// into its ret_code/cout/cerr slots. std::filesystem::path is used for every
+// filesystem location — no platform-specific path encoding.
 
 #include "cc/any_value.hpp"
 #include "cc/host.hpp"
 #include "cc/node.hpp"
 #include "cc/node_factory.hpp"
 #include "cc/plugin_entry.hpp"
-
-#include <boost/asio/buffer.hpp>
-#include <boost/asio/io_context.hpp>
-#include <boost/asio/readable_pipe.hpp>
-#include <boost/process/v2/process.hpp>
-#include <boost/process/v2/stdio.hpp>
-#include <boost/system/error_code.hpp>
+#include "executor.hpp"
 
 #include <atomic>
-#include <cctype>
-#include <chrono>
-#include <cstdio> // std::remove
-#include <cstdlib>
+#include <cstdlib> // std::strtoul
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
-#ifdef _WIN32
-#include <process.h> // _getpid
-#define CC_GET_PID() _getpid()
-#else
-#include <unistd.h> // getpid
-#include <sys/wait.h>
-#define CC_GET_PID() ::getpid()
-#endif
 
 namespace cc::basic
 {
@@ -504,13 +488,14 @@ namespace
     //
     //   inputs:  exe (path), args (text, optional)
     //   outputs: ret_code (long), cout (text), cerr (text)
-    //   property: merge_stderr (bool, default false) — analogous to `2>&1`
+    //   properties:
+    //     merge_stderr (bool, default false) — fold stderr into stdout (2>&1)
+    //     timeout_ms   (int,  default 0)      — kill the child after N ms (0=none)
     //
-    // Implementation uses popen()/pclose() with a temp file for stderr — simple,
-    // sync, deadlock-free, and cross-platform (POSIX popen / Windows _popen).
-    // We deliberately avoid boost::process v2 here because its asio pipe loop
-    // hangs on Linux when the child is a small static binary that exits quickly
-    // (pipe EOF race in v2's process_stdio pipe teardown).
+    // Subprocess launch + capture is delegated to cc::basic::executor (see
+    // executor.hpp), which picks a working launcher per platform (raw Win32 on
+    // Windows, boost.process v2 on POSIX). merge_stderr is applied here in
+    // software: the executor always returns separate stdout/stderr.
     // ---------------------------------------------------------------------------
     class path_in_exe_slot final : public slot
     {
@@ -729,114 +714,49 @@ namespace
                 return std::unexpected(failure {"'exe' input not connected or empty"});
             }
 
-            // Build argv directly from exe + whitespace-split args. We bypass
-            // /bin/sh intentionally: no shell quoting surprises, no shell startup
-            // overhead, no shell-injection surface. exe is run as-is, args is split
-            // by whitespace into separate argv entries.
-            std::vector<std::string> argv_stored;
-            argv_stored.push_back(exe_p->string());
-            if (args_s && !args_s->empty())
-            {
-                std::istringstream iss(*args_s);
-                std::string        tok;
-                while (iss >> tok)
-                {
-                    argv_stored.push_back(tok);
-                }
-            }
-            std::vector<std::string_view> argv;
-            argv.reserve(argv_stored.size());
-            for (const auto &a : argv_stored)
-            {
-                argv.push_back(a);
-            }
-
             const bool merge = props_.get("merge_stderr") == "true"
                             || props_.get("merge_stderr") == "1";
 
-            log("exec[" + id_ + "]: spawn " + exe_p->string() + " (argc=" + std::to_string(argv.size()) + ")");
-
-            namespace proc = boost::process::v2;
-            namespace asio = boost::asio;
-
-            asio::io_context    ctx;
-            asio::readable_pipe out_pipe(ctx);
-            asio::readable_pipe err_pipe(ctx);
-
-            // v2 in boost 1.90: process_stdio{ in, out, err }. nullptr → /dev/null
-            // (POSIX) / NUL (Windows). Each output binding creates a pipe internally;
-            // the *child* end (write fd) lives inside the binding until the binding
-            // is destroyed. We MUST destroy stdio right after spawn so the parent's
-            // copy of the write end is closed — otherwise the readable_pipe never
-            // sees EOF and read_some blocks forever.
-            boost::system::error_code ec;
-            proc::process             child = [&]
+            // Optional timeout, in milliseconds. Malformed / zero values → none.
+            std::optional<unsigned> timeout;
+            if (auto sv = props_.get("timeout_ms"); !sv.empty())
             {
-                proc::process_stdio s = [&]
-                {
-                    if (merge)
-                    {
-                        return proc::process_stdio {nullptr, out_pipe, out_pipe};
-                    }
-                    return proc::process_stdio {nullptr, out_pipe, err_pipe};
-                }();
-                return proc::default_process_launcher()(
-                        ctx, ec, *exe_p, argv_stored, s
-                );
-                // s destroyed here → child-end write fds closed in parent.
-            }();
-            if (ec)
-            {
-                log("exec[" + id_ + "]: spawn FAILED: " + ec.message());
-                return std::unexpected(failure {"spawn failed: " + ec.message()});
+                char           *end = nullptr;
+                unsigned long   ms  = std::strtoul(sv.data(), &end, 10);
+                if (end != sv.data() && ms != 0)
+                    timeout = static_cast<unsigned>(ms);
             }
-            log("exec[" + id_ + "]: pid=" + std::to_string(child.id()));
 
-            // Drain each pipe in its own thread via blocking read_some. Concurrent
-            // reads are essential — a single-threaded loop that reads stdout-then-
-            // stderr would deadlock on a child that fills the stderr pipe while we
-            // wait on stdout. Each thread loops until EOF (child closed its end).
-            auto drain = [](asio::readable_pipe &pipe)
+            std::string exe  = exe_p->string();
+            std::string args = args_s ? *args_s : std::string {};
+
+            log("exec[" + id_ + "]: spawn " + exe + (args.empty() ? "" : " " + args));
+
+            // Hand off to the platform executor: raw Win32 on Windows, boost.
+            // process v2 on POSIX. Both return {code, out, err} or an error.
+            auto r = executor::exec(exe, args, timeout);
+            if (!r)
             {
-                std::string out;
-                char        buf[4096];
-                while (true)
-                {
-                    boost::system::error_code rec;
-                    std::size_t               n = pipe.read_some(asio::buffer(buf), rec);
-                    if (n > 0)
-                    {
-                        out.append(buf, n);
-                    }
-                    if (rec)
-                    {
-                        break; // eof or error
-                    }
-                }
-                return out;
-            };
+                return std::unexpected(failure {r.error().what});
+            }
 
-            std::string out, err;
-            std::thread out_t([&]
-                              {
-                                  out = drain(out_pipe);
-                              });
-            std::thread err_t([&]
-                              {
-                                  err = merge ? std::string {} : drain(err_pipe);
-                              });
-            out_t.join();
-            err_t.join();
+            std::string out = std::move(r->out);
+            std::string err = std::move(r->err);
+            if (merge)
+            {
+                out += err;
+                err.clear();
+            }
 
-            child.wait();
-            long code = child.exit_code();
-            log("exec[" + id_ + "]: exit_code = " + std::to_string(code) + ", cout=" + std::to_string(out.size()) + "B" + ", cerr=" + std::to_string(err.size()) + "B");
+            log("exec[" + id_ + "]: exit_code = " + std::to_string(r->code)
+                + ", cout=" + std::to_string(out.size()) + "B"
+                + ", cerr=" + std::to_string(err.size()) + "B");
 
             for (auto &[slot_id, out_v] : outputs)
             {
                 if (slot_id == "ret_code")
                 {
-                    *out_v = code;
+                    *out_v = r->code;
                 }
                 else if (slot_id == "cout")
                 {
@@ -883,6 +803,7 @@ namespace
         {
             static constexpr property_desc schema[] = {
                     {"merge_stderr", "Merge stderr into stdout (2>&1)", property_kind::boolean, "false"},
+                    {"timeout_ms", "Kill the child after N ms (0 = none)", property_kind::text, "0"},
             };
             return schema;
         }

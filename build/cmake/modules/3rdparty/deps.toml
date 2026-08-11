@@ -30,7 +30,7 @@ deps = []
 #   aliases = { "pkg::x" = "X" }
 [dep.GTest]
 package = "GTest"
-version = "1.15.2"
+version = "1.18.0"
 
 # Boost — optional overrides (uncomment a line inside the table to enable):
 #   options       = ["OPT=ON", "..."]   # extra CPMAddPackage args
@@ -55,6 +55,7 @@ version = "1.90.0"
 [dep.imgui_bundle]
 package = "imgui_bundle"
 version = "1.92.801"
+patches = ["imcoolbar-cstdint"]
 
 # AnyAny — optional overrides (uncomment a line inside the table to enable):
 #   options       = ["OPT=ON", "..."]   # extra CPMAddPackage args

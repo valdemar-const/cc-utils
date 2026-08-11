@@ -2600,12 +2600,14 @@ main()
 
         if (HelloImGui::AssetExists("fonts/NotoColorEmoji.ttf"))
         {
+#if defined(IMGUI_USE_WCHAR32)
             static const ImWchar          emoji_ranges[] = {0x1F600, 0x1F64F, 0x2764, 0x2764, 0, 0};
             HelloImGui::FontLoadingParams em;
             em.mergeToLastFont        = true;
             em.loadColor              = true;
             em.fontConfig.GlyphRanges = emoji_ranges;
             HelloImGui::LoadFont("fonts/NotoColorEmoji.ttf", 20.0f, em);
+#endif
         }
 
         if (HelloImGui::AssetExists("fonts/IBMPlexMono-Regular.ttf"))

@@ -32,8 +32,7 @@ class pipeline_xml_fixture : public ::testing::Test {
  protected:
   void SetUp() override {
     host_ = cc::runtime::make_host_registry();
-    cc::runtime::plugin_loader loader;
-    const std::size_t loaded = loader.load_all(*host_);
+    const std::size_t loaded = loader_.load_all(*host_);
     ASSERT_GE(loaded, 4u) << "expected basic/tl/tl-ir/x86_64 plugins; got "
                           << loaded;
   }
@@ -48,6 +47,10 @@ class pipeline_xml_fixture : public ::testing::Test {
     return id;
   }
 
+  // loader_ must be declared before (and so outlive) host_: host_ owns factory
+  // objects whose vtables live in the plugin DLLs, freed by ~plugin_loader.
+  // Members destruct in reverse declaration order.
+  cc::runtime::plugin_loader loader_;
   std::unique_ptr<cc::host_registry> host_;
 };
 

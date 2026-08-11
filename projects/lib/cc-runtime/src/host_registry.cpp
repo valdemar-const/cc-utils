@@ -4,6 +4,7 @@
 #include "cc/registry.hpp"
 #include "cc/view.hpp"
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <span>

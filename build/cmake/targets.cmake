@@ -119,8 +119,14 @@ endfunction()
 # ---------------------------------------------------------------------------
 # cc_add_plugin(<name> SOURCES ... [PUBLIC_DEPS ...] [PRIVATE_DEPS ...])
 #
-# A MODULE library built for runtime loading (dlopen): file is exactly
-# <name>.so / <name>.dll (no `lib` prefix), placed in CMAKE_LIBRARY_OUTPUT_DIRECTORY.
+# A MODULE library built for runtime loading (dlopen/LoadLibrary): file is
+# exactly <name>.so / <name>.dll (no `lib` prefix). Plugins are build-tree
+# "assets" — they are never linked against, only discovered and loaded by the
+# host at runtime — so they go to CC_PLUGIN_OUTPUT_DIRECTORY (plugins/), apart
+# from build-linked shared libs (lib/) and executables (bin/). The host's
+# plugin_loader searches exe_dir/plugins and exe_dir/../plugins; on Windows the
+# plugin's shared dependencies resolve automatically because they sit beside the
+# host executable in bin/ (the OS "application directory").
 # ---------------------------------------------------------------------------
 function(cc_add_plugin name)
   cmake_parse_arguments(ARG "" "" "SOURCES;PUBLIC_DEPS;PRIVATE_DEPS" ${ARGN})
@@ -130,6 +136,11 @@ function(cc_add_plugin name)
     OUTPUT_NAME ${name}
     PREFIX ""
     POSITION_INDEPENDENT_CODE ON)
+  # A MODULE's .dll is the RUNTIME artifact (Windows), its .so is the LIBRARY
+  # artifact (POSIX) — set both so the module lands in plugins/ everywhere.
+  set_target_properties(${name} PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CC_PLUGIN_OUTPUT_DIRECTORY}"
+    LIBRARY_OUTPUT_DIRECTORY  "${CC_PLUGIN_OUTPUT_DIRECTORY}")
   if(ARG_PUBLIC_DEPS OR ARG_PRIVATE_DEPS)
     target_link_libraries(${name}
       PUBLIC  ${ARG_PUBLIC_DEPS}

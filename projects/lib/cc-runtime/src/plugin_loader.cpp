@@ -17,6 +17,9 @@
 #include <limits.h>
 #include <unistd.h> // readlink /proc/self/exe
 #endif
+#ifdef _WIN32
+#include <windows.h> // GetModuleFileNameA
+#endif
 
 namespace cc::runtime
 {
@@ -44,13 +47,25 @@ namespace
     std::string
     exe_dir()
     {
-#ifdef __linux__
+#if defined(__linux__)
         char    buf[PATH_MAX];
         ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf));
         if (n > 0)
         {
             std::string p(buf, static_cast<size_t>(n));
             auto        slash = p.find_last_of('/');
+            if (slash != std::string::npos)
+            {
+                return p.substr(0, slash);
+            }
+        }
+#elif defined(_WIN32)
+        char  buf[MAX_PATH];
+        DWORD n = ::GetModuleFileNameA(nullptr, buf, static_cast<DWORD>(sizeof(buf)));
+        if (n > 0 && n < sizeof(buf))
+        {
+            std::string p(buf, static_cast<size_t>(n));
+            auto        slash = p.find_last_of("\\/");
             if (slash != std::string::npos)
             {
                 return p.substr(0, slash);
@@ -63,6 +78,11 @@ namespace
     auto
     search_dirs() -> std::vector<std::string>
     {
+#if defined(_WIN32)
+        constexpr char sep = ';'; // PATH-style on Windows — ':' would slice "C:\"
+#else
+        constexpr char sep = ':';
+#endif
         std::vector<std::string> dirs;
         if (const char *env = std::getenv("CCP_PLUGIN_PATH"); env && *env)
         {
@@ -70,19 +90,23 @@ namespace
             std::size_t beg = 0;
             while (true)
             {
-                auto sep = s.find(':', beg);
-                if (sep == std::string::npos)
+                auto p = s.find(sep, beg);
+                if (p == std::string::npos)
                 {
                     dirs.emplace_back(s.substr(beg));
                     break;
                 }
-                dirs.emplace_back(s.substr(beg, sep - beg));
-                beg = sep + 1;
+                dirs.emplace_back(s.substr(beg, p - beg));
+                beg = p + 1;
             }
         }
+        // Plugins are runtime "assets" discovered relative to the host
+        // executable. Two layouts are covered: installed (plugins/ is a
+        // subdirectory of exe_dir, beside the binary) and the cc-utils build
+        // tree (plugins/ is a sibling of bin/, i.e. one level up from exe_dir).
         std::string ed = exe_dir();
-        dirs.push_back(ed);
-        dirs.push_back(ed + "/../lib");
+        dirs.push_back(ed + "/plugins");
+        dirs.push_back(ed + "/../plugins");
         dirs.push_back(".");
         return dirs;
     }

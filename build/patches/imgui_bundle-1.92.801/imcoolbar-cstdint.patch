@@ -1,0 +1,15 @@
+ImCoolBar uses int32_t but only includes <cassert>; add <cstdint>.
+
+Upstream bug exposed with GCC + -std=c++23 (transitive includes no longer
+pull in <cstdint>). Trivially fixed by adding the include.
+
+--- a/external/ImCoolBar/ImCoolBar/ImCoolBar.cpp
++++ b/external/ImCoolBar/ImCoolBar/ImCoolBar.cpp
+@@ -27,6 +27,7 @@
+ #include <vector>
+ #include <array>
+ #include <cassert>
++#include <cstdint>
+ 
+ #define ICB_PREFIX "ICB"
+ #define ICB_TYPE_MAGIC 0x49434231  // "ICB1"

@@ -396,6 +396,37 @@ namespace
                 os << *asm_text;
             }
             log("assemble[" + id_ + "]: running nasm");
+#if defined(_WIN32)
+            // Win64 COFF object. Link with gcc — it pulls in the C runtime
+            // (entry = mainCRTStartup -> calls main -> ExitProcess(ret)). On
+            // Windows there is no raw exit syscall, so we rely on the CRT.
+            if (std::system(("nasm -f win64 " + asm_path.string() + " -o " + obj_path.string()).c_str()) != 0)
+            {
+                log("assemble[" + id_ + "]: nasm failed");
+                std::remove(asm_path.string().c_str());
+                return std::unexpected(failure {"nasm failed (see console)"});
+            }
+            log("assemble[" + id_ + "]: running gcc (link)");
+            if (std::system(("gcc " + obj_path.string() + " -o " + exe.string()).c_str()) != 0)
+            {
+                log("assemble[" + id_ + "]: gcc link failed");
+                std::remove(asm_path.string().c_str());
+                std::remove(obj_path.string().c_str());
+                return std::unexpected(failure {"gcc link failed (see console)"});
+            }
+            // MinGW gcc auto-appends ".exe" when -o omits the extension; report the
+            // file actually produced so the downstream exec node gets a runnable
+            // path (cmd.exe won't launch a PE with no extension).
+            if (!std::filesystem::exists(exe))
+            {
+                std::filesystem::path with_ext = exe;
+                with_ext += ".exe";
+                if (std::filesystem::exists(with_ext))
+                {
+                    exe = with_ext;
+                }
+            }
+#else
             if (std::system(("nasm -f elf64 " + asm_path.string() + " -o " + obj_path.string()).c_str()) != 0)
             {
                 log("assemble[" + id_ + "]: nasm failed");
@@ -410,6 +441,7 @@ namespace
                 std::remove(obj_path.string().c_str());
                 return std::unexpected(failure {"ld failed (see console)"});
             }
+#endif
             std::remove(asm_path.string().c_str());
             std::remove(obj_path.string().c_str());
             log("assemble[" + id_ + "]: ok, exe = " + exe.string());

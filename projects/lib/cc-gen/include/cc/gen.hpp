@@ -16,7 +16,8 @@ namespace cc::nasm
 enum class mnemonic : std::uint8_t
 {
     mov,
-    syscall
+    syscall,
+    ret
 };
 enum class operand_kind : std::uint8_t
 {

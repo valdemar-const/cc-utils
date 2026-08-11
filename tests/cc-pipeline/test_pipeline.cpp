@@ -59,8 +59,11 @@ void connect(cc::runtime::graph& g,
 // The full "return 42;" pipeline — text constant to exit code, end-to-end.
 TEST(cc_pipeline, return_42_end_to_end) {
   // --- Bootstrap: load every cc-plugin-*.so found in CCP_PLUGIN_PATH. ----
-  auto host = cc::runtime::make_host_registry();
+  // Loader must outlive the host: the host owns factory objects whose vtables
+  // live in the plugin DLLs, so the DLLs (freed by ~plugin_loader) may only
+  // unload after the host has deleted those factories. Declare loader first.
   cc::runtime::plugin_loader loader;
+  auto host = cc::runtime::make_host_registry();
   std::size_t loaded = loader.load_all(*host);
   ASSERT_GE(loaded, 4u)
       << "expected at least basic/tl/tl-ir/x86_64 plugins to load; "
@@ -95,6 +98,10 @@ TEST(cc_pipeline, return_42_end_to_end) {
                 / "cc_pipeline_test_return42";
   std::error_code rm_ec;
   std::filesystem::remove(exe_path, rm_ec);
+#ifdef _WIN32
+  // MinGW gcc appends ".exe" to the output name; clear both forms.
+  { std::filesystem::path with_ext = exe_path; with_ext += ".exe"; std::filesystem::remove(with_ext, rm_ec); }
+#endif
   {
     auto* n = g.find_node(asm_id);
     ASSERT_NE(n, nullptr);
@@ -125,14 +132,18 @@ TEST(cc_pipeline, return_42_end_to_end) {
   EXPECT_EQ(*code, 42);
 
   // Sanity: the binary should exist at the requested path.
+#ifdef _WIN32
+  { std::filesystem::path with_ext = exe_path; with_ext += ".exe"; EXPECT_TRUE(std::filesystem::exists(with_ext)); }
+#else
   EXPECT_TRUE(std::filesystem::exists(exe_path));
+#endif
 }
 
 // Smoke test: text.constant → text.from_file path round-trips through View.
 // Verifies that wire type `text` and `path` registrations don't collide.
 TEST(cc_pipeline, text_constant_emits_string) {
+  cc::runtime::plugin_loader loader;  // outlives host (see teardown note above)
   auto host = cc::runtime::make_host_registry();
-  cc::runtime::plugin_loader loader;
   ASSERT_GE(loader.load_all(*host), 1u);
 
   cc::runtime::graph g;

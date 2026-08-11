@@ -39,6 +39,21 @@ lower(const cc::ir::module &mod)
         {
         case cc::ir::opcode::ret:
             {
+#if defined(_WIN32)
+                // Win32/PE: we emit `main` returning imm in rax; the CRT startup
+                // pulled in by `gcc` at link time calls ExitProcess(main()).
+                // (Windows has no raw exit syscall — it goes through kernel32.)
+                cc::nasm::instr a;
+                a.mn     = cc::nasm::mnemonic::mov;
+                a.ops[0] = {cc::nasm::operand_kind::reg, cc::nasm::reg::rax, 0};
+                a.ops[1] = {cc::nasm::operand_kind::imm, cc::nasm::reg::rax, i.imm};
+                out.push_back(a);
+
+                cc::nasm::instr b;
+                b.mn = cc::nasm::mnemonic::ret;
+                out.push_back(b);
+#else
+                // Linux/ELF: sys_exit(imm) via the raw x86_64 syscall interface.
                 cc::nasm::instr a;
                 a.mn     = cc::nasm::mnemonic::mov;
                 a.ops[0] = {cc::nasm::operand_kind::reg, cc::nasm::reg::rax, 0};
@@ -54,6 +69,7 @@ lower(const cc::ir::module &mod)
                 cc::nasm::instr c;
                 c.mn = cc::nasm::mnemonic::syscall;
                 out.push_back(c);
+#endif
                 break;
             }
         }
@@ -65,7 +81,12 @@ std::string
 format(const std::vector<cc::nasm::instr> &instrs)
 {
     std::string s;
+#if defined(_WIN32)
+    // Win32/PE: entry symbol is `main` (CRT startup calls it, then ExitProcess).
+    s += "global main\nsection .text\nmain:\n";
+#else
     s += "global _start\nsection .text\n_start:\n";
+#endif
     for (const auto &i : instrs)
     {
         s += "    ";
@@ -91,6 +112,9 @@ format(const std::vector<cc::nasm::instr> &instrs)
             }
         case cc::nasm::mnemonic::syscall:
             s += "syscall";
+            break;
+        case cc::nasm::mnemonic::ret:
+            s += "ret";
             break;
         }
         s += "\n";

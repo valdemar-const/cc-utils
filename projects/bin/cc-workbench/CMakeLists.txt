@@ -8,7 +8,7 @@ cc_add_executable(${PROJECT_NAME}
     ne/builders.cpp
     ne/drawing.cpp
     ne/widgets.cpp
-  PRIVATE_DEPS cc-pipeit::cc-pipeit imgui_bundle
+  PRIVATE_DEPS cc-runtime::cc-runtime imgui_bundle
 )
 target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 

@@ -13,6 +13,24 @@ void graph::add_node(std::unique_ptr<node> n) {
 }
 
 void graph::add_edge(edge e) {
+  // Single-cardinality inputs are single-source: a new edge to the same
+  // (dst_node, dst_slot) replaces any existing one. Multi-cardinality slots
+  // (e.g. View.in) accept multiple incoming edges.
+  if (auto* n = find_node(e.dst_node); n != nullptr) {
+    const cc::slot* target = nullptr;
+    for (auto* s : n->slots()) {
+      if (s->id() == e.dst_slot) { target = s; break; }
+    }
+    if (target != nullptr && target->card() == slot_card::single) {
+      edges_.erase(
+          std::remove_if(edges_.begin(), edges_.end(),
+                         [&](const edge& existing) {
+                           return existing.dst_node == e.dst_node &&
+                                  existing.dst_slot == e.dst_slot;
+                         }),
+          edges_.end());
+    }
+  }
   edges_.push_back(std::move(e));
 }
 

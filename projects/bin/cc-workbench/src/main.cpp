@@ -175,6 +175,7 @@ struct AppState {
   std::string                  view_cached_error;
   std::string                  view_cached_type_name;
   bool                         view_cache_stale     = true;   // invalidation flag
+  std::chrono::steady_clock::time_point view_stale_since = {};  // for debounce
   // Background pull state.
   std::future<std::pair<std::string, std::optional<cc::any_value>>> view_pull_future;
   std::string                  view_pull_target;               // node being pulled
@@ -245,10 +246,12 @@ ed::EditorContext* g_editor = nullptr;
 noop_view_context g_view_ctx;
 
 // Drop the View-tab cache after any graph mutation. Cheap; called from every
-// node/edge/property change site. Marks cache stale (Refresh button will show
-// "*"); the user re-pulls explicitly so the host UI never auto-blocks.
+// node/edge/property change site. Marks cache stale and stamps the time so
+// the View tab can debounce auto-pull (avoid storming pulls on every keystroke
+// in a multiline property editor).
 inline void invalidate_view_cache() {
-  g_state.view_cache_stale = true;
+  g_state.view_cache_stale  = true;
+  g_state.view_stale_since  = std::chrono::steady_clock::now();
 }
 
 void log(std::string msg) {
@@ -1070,34 +1073,9 @@ void draw_view_window() {
 
   ImGui::SameLine();
 
-  // If a background pull is running, poll its status. Otherwise offer Refresh.
-  if (g_state.view_pull_running) {
-    using namespace std::chrono_literals;
-    if (g_state.view_pull_future.wait_for(0s) == std::future_status::ready) {
-      auto [error_or_type, value_opt] = g_state.view_pull_future.get();
-      g_state.view_pull_running = false;
-      g_state.view_cached_for    = g_state.view_pull_target;
-      g_state.view_cache_stale   = false;
-      if (!error_or_type.empty()) {
-        // First slot of the pair carries the error message on failure.
-        g_state.view_cached_error = std::move(error_or_type);
-        g_state.view_cached_value.reset();
-      } else {
-        g_state.view_cached_error.clear();
-        g_state.view_cached_value = std::move(value_opt);
-      }
-    }
-  }
-
-  const bool can_refresh = !g_state.view_pull_running;
-  const char* label = g_state.view_pull_running
-                          ? "Working..."
-                          : (g_state.view_cache_stale ? "Refresh*" : "Refresh");
-  if (!can_refresh) { ImGui::BeginDisabled(); }
-  if (ImGui::Button(label) && can_refresh) {
-    // Snapshot the graph by value would be ideal; for MVP we trust the user
-    // does not mutate the graph between Refresh and pull completion. Run the
-    // pull on a worker thread so the host UI stays responsive.
+  // Trigger a background pull either because the user clicked Refresh or
+  // because the cache has been stale longer than the debounce window.
+  auto trigger_pull = [&]() {
     g_state.view_pull_target  = g_state.view_selected;
     g_state.view_pull_running = true;
     g_state.view_cached_error.clear();
@@ -1119,16 +1097,54 @@ void draw_view_window() {
           // any_value is copyable (aa::copy) — copy into the optional.
           return {std::string{}, std::optional<cc::any_value>{*v}};
         });
+  };
+
+  // If a background pull is running, poll its status. Otherwise decide
+  // whether to trigger a new pull (auto-react with debounce, or manual).
+  if (g_state.view_pull_running) {
+    using namespace std::chrono_literals;
+    if (g_state.view_pull_future.wait_for(0s) == std::future_status::ready) {
+      auto [error_or_type, value_opt] = g_state.view_pull_future.get();
+      g_state.view_pull_running = false;
+      g_state.view_cached_for    = g_state.view_pull_target;
+      g_state.view_cache_stale   = false;
+      if (!error_or_type.empty()) {
+        g_state.view_cached_error = std::move(error_or_type);
+        g_state.view_cached_value.reset();
+      } else {
+        g_state.view_cached_error.clear();
+        g_state.view_cached_value = std::move(value_opt);
+      }
+    }
+  } else if (!g_state.view_selected.empty()) {
+    // Reactive: if the cache is stale and no pull is running, wait out the
+    // debounce window (so rapid edits don't storm pulls) then trigger
+    // automatically. The user can also click Refresh to skip the wait.
+    constexpr auto kDebounce = std::chrono::milliseconds(150);
+    const bool debounce_elapsed =
+        !g_state.view_cache_stale ||
+        (std::chrono::steady_clock::now() - g_state.view_stale_since >= kDebounce);
+    if (debounce_elapsed) {
+      trigger_pull();
+    }
+  }
+
+  // Manual Refresh button (instant — skips debounce).
+  const bool can_refresh = !g_state.view_pull_running;
+  const char* label = g_state.view_pull_running
+                          ? "Working..."
+                          : (g_state.view_cache_stale ? "Refresh*" : "Refresh");
+  if (!can_refresh) { ImGui::BeginDisabled(); }
+  if (ImGui::Button(label) && can_refresh) {
+    trigger_pull();
   }
   if (!can_refresh) { ImGui::EndDisabled(); }
 
   ImGui::SameLine();
   if (g_state.view_pull_running) {
     ImGui::TextDisabled("(pulling %s ...)", g_state.view_pull_target.c_str());
-  } else if (g_state.view_cache_stale && !g_state.view_cached_for.empty()) {
-    ImGui::TextDisabled("(stale — click Refresh)");
   } else {
-    ImGui::TextDisabled("(pull on demand)");
+    ImGui::TextDisabled("(reactive, %ums debounce)", 150u);
   }
 
   ImGui::Separator();

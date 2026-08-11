@@ -145,6 +145,10 @@ struct AppState {
   struct pending_position { int ed_id; ImVec2 canvas_pos; };
   std::vector<pending_position> pending_positions;
 
+  // Status / menu state.
+  std::size_t loaded_plugins = 0;
+  bool        about_open     = false;
+
   // Fonts
   ImFont* ui_font   = nullptr;
   ImFont* mono_font = nullptr;
@@ -753,6 +757,99 @@ void draw_view_window() {
   renderer->render(*value, ctx);
 }
 
+// ---------------------------------------------------------------------------
+// Main menu, About popup, status bar
+// ---------------------------------------------------------------------------
+#ifndef CC_VERSION_STRING
+#define CC_VERSION_STRING "0.0.0.0"
+#endif
+
+void draw_main_menu(HelloImGui::DockingParams& docking) {
+  // ---- File ----
+  if (ImGui::BeginMenu("File")) {
+    if (ImGui::MenuItem("Clear Graph")) {
+      // remove_node invalidates the span, so collect ids first.
+      std::vector<std::string> ids;
+      ids.reserve(g_state.g.nodes().size());
+      for (auto const& n : g_state.g.nodes()) ids.emplace_back(n->instance_id());
+      for (auto const& id : ids) {
+        g_state.g.remove_edges_of(id);
+        g_state.g.remove_node(id);
+      }
+      g_state.inst2ed.clear();
+      g_state.ed2inst.clear();
+      g_state.view_selected.clear();
+      log("graph cleared");
+    }
+    ImGui::Separator();
+    if (ImGui::MenuItem("Quit", "Alt+F4")) {
+      HelloImGui::GetRunnerParams()->appShallExit = true;
+    }
+    ImGui::EndMenu();
+  }
+
+  // ---- View (window visibility toggles) ----
+  if (ImGui::BeginMenu("View")) {
+    for (auto& w : docking.dockableWindows) {
+      if (w.includeInViewMenu) {
+        ImGui::MenuItem(w.label.c_str(), nullptr, &w.isVisible);
+      }
+    }
+    ImGui::EndMenu();
+  }
+
+  // ---- Help ----
+  if (ImGui::BeginMenu("Help")) {
+    if (ImGui::MenuItem("About cc-workbench")) {
+      g_state.about_open = true;
+    }
+    ImGui::EndMenu();
+  }
+}
+
+void draw_about_popup() {
+  // OpenPopup must be called from outside the modal popup itself, on the
+  // same frame; we trigger it off the about_open flag set by the menu item.
+  static bool should_open = false;
+  if (g_state.about_open) { should_open = true; g_state.about_open = false; }
+  if (should_open) {
+    ImGui::OpenPopup("About cc-workbench");
+    should_open = false;
+  }
+  ImGui::SetNextWindowSize(ImVec2(360, 200), ImGuiCond_Appearing);
+  if (ImGui::BeginPopupModal("About cc-workbench", nullptr,
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings)) {
+    ImGui::TextDisabled("cc-workbench");
+    ImGui::Spacing();
+    ImGui::Text("Version:   v%s", CC_VERSION_STRING);
+    ImGui::Text("Plugins:   %zu loaded", g_state.loaded_plugins);
+    ImGui::Text("Node types: %zu registered",
+                g_state.host->node_factories().size());
+    ImGui::Separator();
+    ImGui::TextDisabled("Node-graph platform host.\nBuilt with Dear ImGui, "
+                        "imgui-node-editor, AnyAny.");
+    ImGui::Spacing();
+    if (ImGui::Button("Close", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+  }
+}
+
+void draw_status_bar() {
+  // Left: live counts.
+  ImGui::Text("Plugins: %zu   Nodes: %zu   Edges: %zu",
+              g_state.loaded_plugins,
+              g_state.g.nodes().size(),
+              g_state.g.edges().size());
+
+  // Right: semver vMaj.Min.Rev.Patch (Blender-style).
+  std::string version = "v" + std::string{CC_VERSION_STRING};
+  float avail = ImGui::GetContentRegionAvail().x;
+  float text_w = ImGui::CalcTextSize(version.c_str()).x;
+  ImGui::SameLine(avail - text_w);
+  ImGui::TextDisabled("%s", version.c_str());
+}
+
 }  // namespace
 
 int main() {
@@ -760,6 +857,7 @@ int main() {
   g_state.host->renderers().register_renderer(std::make_unique<text_view_renderer>());
 
   std::size_t loaded = g_state.loader.load_all(*g_state.host);
+  g_state.loaded_plugins = loaded;
   log(std::string{"cc-workbench ready. plugins loaded: "} + std::to_string(loaded));
   log(std::string{"node types registered: "} +
       std::to_string(g_state.host->node_factories().size()));
@@ -769,6 +867,18 @@ int main() {
   params.appWindowParams.windowGeometry.size = {1480, 820};
   params.imGuiWindowParams.defaultImGuiWindowType =
       HelloImGui::DefaultImGuiWindowType::ProvideFullScreenDockSpace;
+
+  // Main menu + status bar.
+  params.imGuiWindowParams.showMenuBar     = true;
+  params.imGuiWindowParams.showMenu_App    = false;  // we provide our own File/Help
+  params.imGuiWindowParams.showMenu_View   = false;  // we provide our own View
+  params.imGuiWindowParams.showStatusBar   = true;
+  params.imGuiWindowParams.showStatus_Fps  = false;  // we put version there
+  params.callbacks.ShowMenus = [&docking = params.dockingParams]() {
+    draw_main_menu(docking);
+  };
+  params.callbacks.ShowStatus = []() { draw_status_bar(); };
+  params.callbacks.ShowGui    = []() { draw_about_popup(); };
 
   // Bottom dock for View + Logger (~40%).
   {

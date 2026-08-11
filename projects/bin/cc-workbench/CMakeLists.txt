@@ -1,4 +1,4 @@
-project(cc-workbench VERSION 0.1.0 LANGUAGES CXX)
+project(cc-workbench VERSION 0.1.0.0 LANGUAGES CXX)
 
 find_package(imgui_bundle REQUIRED)
 
@@ -11,6 +11,11 @@ cc_add_executable(${PROJECT_NAME}
   PRIVATE_DEPS cc-runtime::cc-runtime imgui_bundle
 )
 target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Semver string (Blender-style vMaj.Min.Rev.Patch) — used by status bar.
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+    CC_VERSION_STRING="${PROJECT_VERSION}"
+)
 
 # Ship assets (fonts + examples) next to the executable. An always-run custom
 # target (not a stamp) is used on purpose: extracted/added files often keep an

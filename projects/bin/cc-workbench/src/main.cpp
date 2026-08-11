@@ -603,6 +603,20 @@ struct create_menu_state {
 };
 create_menu_state g_create_menu;
 
+// Palette that opens when the user drags a link from a pin and releases in
+// empty canvas space. Filters node factories to those that have at least one
+// slot whose type is connectable to the dragged pin's type.
+struct palette_drop_state {
+  bool                 open          = false;
+  ImVec2               canvas_pos{};      // where to place the new node
+  ImVec2               screen_pos{};      // for SetNextWindowPos
+  cc::type_descriptor_t src_type{};       // type of the dragged pin
+  bool                 src_is_output = false;
+  std::string          src_node;
+  std::string          src_slot;
+};
+palette_drop_state g_palette;
+
 void draw_create_menu() {
   if (!g_create_menu.open) return;
 
@@ -666,6 +680,152 @@ void draw_create_menu() {
         }
       }
       ImGui::TreePop();
+    }
+  }
+
+  ImGui::End();
+  ImGui::PopStyleVar(2);
+  ImGui::PopStyleColor(2);
+}
+
+// ---------------------------------------------------------------------------
+// Palette drop — opens when the user drags a link from a pin and releases on
+// empty canvas. Lists node factories filtered by type compatibility with the
+// dragged pin. On select, spawns the node at the drop position and connects
+// the dragged pin to the first compatible slot on the new node.
+// ---------------------------------------------------------------------------
+void draw_palette_drop() {
+  if (!g_palette.open) return;
+
+  ImGui::SetNextWindowPos(g_palette.screen_pos);
+  ImGui::SetNextWindowSize(ImVec2(260, 0));
+  ImGui::PushStyleColor(ImGuiCol_WindowBg,        ImVec4(0.13f, 0.14f, 0.17f, 0.98f));
+  ImGui::PushStyleColor(ImGuiCol_ChildBg,         ImVec4(0.13f, 0.14f, 0.17f, 0.98f));
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, 8));
+  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,   ImVec2(6, 4));
+
+  constexpr int kFlags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                         ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing |
+                         ImGuiWindowFlags_NoDocking;
+
+  bool opened = ImGui::Begin("##palette_drop", nullptr, kFlags);
+
+  if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+    g_palette.open = false;
+  }
+  if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+      !ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow)) {
+    g_palette.open = false;
+  }
+
+  if (opened && g_palette.open) {
+    const char* direction = g_palette.src_is_output ? "input" : "output";
+    ImGui::SeparatorText("Connect to new node");
+    ImGui::TextDisabled("looking for %s pin of compatible type", direction);
+    ImGui::Spacing();
+
+    // For each factory, create a transient sample to introspect its slots.
+    // If at least one slot is type-compatible with the dragged pin, list it.
+    auto type_name = g_state.host->types().name_of(g_palette.src_type);
+    if (!type_name.empty()) {
+      ImGui::TextDisabled("source type: %.*s",
+                          static_cast<int>(type_name.size()), type_name.data());
+      ImGui::Spacing();
+    }
+
+    std::map<std::string, std::vector<cc::node_factory*>> by_category;
+    for (auto* f : g_state.host->node_factories()) {
+      by_category[std::string{f->category()}].push_back(f);
+    }
+
+    bool any_compatible = false;
+
+    for (auto& [category, factories] : by_category) {
+      // Gather compatible factories for this category first so we can skip
+      // the entire category header if none match.
+      std::vector<cc::node_factory*> compatible;
+      for (auto* f : factories) {
+        auto sample = f->create();
+        if (!sample) continue;
+        for (auto* s : sample->slots()) {
+          if (g_palette.src_is_output) {
+            // source was an output → need an input on the new node
+            if (s->dir() == cc::slot_dir::in &&
+                g_state.host->types().is_connectable(g_palette.src_type, s->type())) {
+              compatible.push_back(f);
+              break;
+            }
+          } else {
+            // source was an input → need an output on the new node
+            if (s->dir() == cc::slot_dir::out &&
+                g_state.host->types().is_connectable(s->type(), g_palette.src_type)) {
+              compatible.push_back(f);
+              break;
+            }
+          }
+        }
+      }
+      if (compatible.empty()) continue;
+      any_compatible = true;
+
+      ImVec4 dot = header_color_for_category(category);
+      ImGui::PushStyleColor(ImGuiCol_Text, dot);
+      bool expanded = ImGui::TreeNodeEx(category.c_str(), ImGuiTreeNodeFlags_DefaultOpen);
+      ImGui::PopStyleColor();
+      if (!expanded) continue;
+
+      for (auto* f : compatible) {
+        std::string label{f->display_name()};
+        label += "##";
+        label += std::string{f->type_id()};
+        if (ImGui::Selectable(label.c_str())) {
+          // Instantiate and find the first compatible slot to wire.
+          auto new_node = f->create();
+          std::string new_id{new_node->instance_id()};
+          int ed_id = editor_id_for(new_id);
+
+          std::string matched_slot;
+          for (auto* s : new_node->slots()) {
+            if (g_palette.src_is_output) {
+              if (s->dir() == cc::slot_dir::in &&
+                  g_state.host->types().is_connectable(g_palette.src_type, s->type())) {
+                matched_slot = std::string{s->id()};
+                break;
+              }
+            } else {
+              if (s->dir() == cc::slot_dir::out &&
+                  g_state.host->types().is_connectable(s->type(), g_palette.src_type)) {
+                matched_slot = std::string{s->id()};
+                break;
+              }
+            }
+          }
+
+          g_state.g.add_node(std::move(new_node));
+          g_state.pending_positions.push_back({ed_id, g_palette.canvas_pos});
+
+          if (!matched_slot.empty()) {
+            cc::runtime::edge e = g_palette.src_is_output
+                ? cc::runtime::edge{g_palette.src_node, g_palette.src_slot,
+                                     new_id,             matched_slot}
+                : cc::runtime::edge{new_id,             matched_slot,
+                                     g_palette.src_node, g_palette.src_slot};
+            g_state.g.add_edge(std::move(e));
+            log("palette: created " + std::string{f->type_id()} +
+                " and linked " + g_palette.src_slot + " ↔ " + matched_slot);
+          } else {
+            log("palette: created " + std::string{f->type_id()} + " (no auto-link)");
+          }
+          invalidate_view_cache();
+          g_palette.open = false;
+        }
+      }
+      ImGui::TreePop();
+    }
+
+    if (!any_compatible) {
+      ImGui::TextDisabled("(no compatible nodes)");
     }
   }
 
@@ -888,8 +1048,14 @@ void draw_pipeline_canvas() {
   }
 
   // ---- New-link creation (drag from output to input pin) ----
+  // Two outcomes:
+  //   1. dropped on another pin → create edge (QueryNewLink path)
+  //   2. dropped on empty canvas → open palette to spawn a node with a
+  //      type-compatible slot (QueryNewNode path)
   static ed::PinId pending_new_a, pending_new_b;
   static bool      pending_new = false;
+  static ed::PinId pending_drop_pin;
+  static bool      pending_drop = false;
   if (ed::BeginCreate(ImColor(120, 160, 220, 200), 2.0f)) {
     ed::PinId a, b;
     if (ed::QueryNewLink(&a, &b)) {
@@ -897,6 +1063,11 @@ void draw_pipeline_canvas() {
         pending_new_a = a;
         pending_new_b = b;
         pending_new   = true;
+      }
+    } else if (ed::QueryNewNode(&a)) {
+      if (ed::AcceptNewItem()) {
+        pending_drop_pin = a;
+        pending_drop     = true;
       }
     }
     ed::EndCreate();
@@ -937,6 +1108,42 @@ void draw_pipeline_canvas() {
       }
     }
     pending_new = false;
+  }
+  if (pending_drop) {
+    // Decode the dragged pin into (node_instance, slot*) so we can filter
+    // palette candidates by connectable type.
+    auto decode = [](ed::PinId p) -> std::pair<int, int> {
+      int v = static_cast<int>(reinterpret_cast<intptr_t>(p.AsPointer()));
+      return {v / 64, v % 64};
+    };
+    auto [ed_id, slot_idx] = decode(pending_drop_pin);
+    auto it = g_state.ed2inst.find(ed_id);
+    if (it != g_state.ed2inst.end()) {
+      auto* n = g_state.g.find_node(it->second);
+      if (n) {
+        const cc::slot* s = nullptr;
+        int i = 0;
+        for (auto* sp : n->slots()) { if (i == slot_idx) { s = sp; break; } ++i; }
+        if (s) {
+          // Use io.MousePos, NOT MouseClickedPos[Left]: this is a drag, so
+          // the press position sits on the source pin (where the link was
+          // grabbed), while MousePos is the current = release position — i.e.
+          // where the user actually dropped. Inside ed::Begin/End both are
+          // canvas-local (imgui-node-editor transforms io.MousePos);
+          // CanvasToScreen converts to absolute screen for SetNextWindowPos.
+          ImVec2 canvas_pos = ImGui::GetIO().MousePos;
+          ImVec2 screen_pos = ed::CanvasToScreen(canvas_pos);
+          g_palette.open          = true;
+          g_palette.canvas_pos    = canvas_pos;
+          g_palette.screen_pos    = screen_pos;
+          g_palette.src_type      = s->type();
+          g_palette.src_is_output = (s->dir() == cc::slot_dir::out);
+          g_palette.src_node      = it->second;
+          g_palette.src_slot      = std::string{s->id()};
+        }
+      }
+    }
+    pending_drop = false;
   }
 
   // ---- Delete: nodes and links ----
@@ -1017,6 +1224,7 @@ void draw_pipeline_canvas() {
   // Render the menu OUTSIDE ed::Begin/End so it's a plain ImGui window,
   // not affected by the editor's draw channels.
   draw_create_menu();
+  draw_palette_drop();
 }
 
 // ---------------------------------------------------------------------------

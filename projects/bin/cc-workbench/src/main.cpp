@@ -146,8 +146,9 @@ struct AppState {
   std::vector<pending_position> pending_positions;
 
   // Status / menu state.
-  std::size_t loaded_plugins = 0;
-  bool        about_open     = false;
+  std::size_t loaded_plugins      = 0;
+  bool        about_open          = false;
+  bool        canvas_navigate_content = false;
 
   // Fonts
   ImFont* ui_font   = nullptr;
@@ -510,7 +511,35 @@ void draw_node(cc::node& n) {
   b.End();
 }
 
+// Drop every node and edge from the current graph. Canvas-scoped, invoked
+// from the Pipeline tab toolbar.
+void clear_graph() {
+  std::vector<std::string> ids;
+  ids.reserve(g_state.g.nodes().size());
+  for (auto const& n : g_state.g.nodes()) ids.emplace_back(n->instance_id());
+  for (auto const& id : ids) {
+    g_state.g.remove_edges_of(id);
+    g_state.g.remove_node(id);
+  }
+  g_state.inst2ed.clear();
+  g_state.ed2inst.clear();
+  g_state.view_selected.clear();
+  log("graph cleared");
+}
+
 void draw_pipeline_canvas() {
+  // ---- Canvas toolbar (per-tab actions) ----
+  // These commands mutate the graph or the editor view — they belong to the
+  // Pipeline tab, not the global menu. Navigate-style buttons set a flag
+  // consumed inside ed::Begin/End below, where an editor context is current.
+  if (ImGui::Button("Zoom to Fit")) g_state.canvas_navigate_content = true;
+  ImGui::SameLine();
+  if (ImGui::Button("Clear"))       clear_graph();
+  ImGui::SameLine();
+  ImGui::TextDisabled("|  nodes: %zu   edges: %zu",
+                      g_state.g.nodes().size(), g_state.g.edges().size());
+  ImGui::Separator();
+
   ed::SetCurrentEditor(g_editor);
   ed::Begin("Pipeline Graph", ImVec2(0, ImGui::GetContentRegionAvail().y));
 
@@ -522,6 +551,11 @@ void draw_pipeline_canvas() {
       ed::SetNodePosition(pp.ed_id, pp.canvas_pos);
     }
     g_state.pending_positions.clear();
+  }
+
+  if (g_state.canvas_navigate_content) {
+    ed::NavigateToContent();
+    g_state.canvas_navigate_content = false;
   }
 
   for (auto const& node_ptr : g_state.g.nodes()) {
@@ -766,22 +800,9 @@ void draw_view_window() {
 
 void draw_main_menu(HelloImGui::DockingParams& docking) {
   // ---- File ----
+  // Only truly global commands live here: tab creation (future), app quit.
+  // Canvas-specific actions (Clear, Run, ...) belong to the canvas toolbar.
   if (ImGui::BeginMenu("File")) {
-    if (ImGui::MenuItem("Clear Graph")) {
-      // remove_node invalidates the span, so collect ids first.
-      std::vector<std::string> ids;
-      ids.reserve(g_state.g.nodes().size());
-      for (auto const& n : g_state.g.nodes()) ids.emplace_back(n->instance_id());
-      for (auto const& id : ids) {
-        g_state.g.remove_edges_of(id);
-        g_state.g.remove_node(id);
-      }
-      g_state.inst2ed.clear();
-      g_state.ed2inst.clear();
-      g_state.view_selected.clear();
-      log("graph cleared");
-    }
-    ImGui::Separator();
     if (ImGui::MenuItem("Quit", "Alt+F4")) {
       HelloImGui::GetRunnerParams()->appShallExit = true;
     }

@@ -16,6 +16,9 @@
 #include "cc/runner.hpp"
 #include "cc/view.hpp"
 
+#include <cc/astit.hpp>  // cc::ast::tl_program, visitor for AST view renderer
+#include <cc/ir.hpp>     // cc::ir::module for IR view renderer
+
 #include "hello_imgui/hello_imgui.h"
 #include "imgui-node-editor/imgui_node_editor.h"
 #include "imgui_stacklayout.h"          // ImGui::Spring
@@ -27,6 +30,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <memory>
@@ -248,6 +252,124 @@ class text_view_renderer final : public cc::view_renderer {
     }
     if (g_state.mono_font) ImGui::PushFont(g_state.mono_font);
     editor_.Render("##view_text", ImVec2(0, 0), false);
+    if (g_state.mono_font) ImGui::PopFont();
+  }
+
+ private:
+  TextEditor  editor_;
+  std::string last_content_;
+};
+
+// ---------------------------------------------------------------------------
+// IR view renderer — renders cc::ir::module as a textual instruction listing.
+// ---------------------------------------------------------------------------
+class ir_view_renderer final : public cc::view_renderer {
+ public:
+  ir_view_renderer() {
+    editor_.SetPalette(TextEditor::GetDarkPalette());
+    editor_.SetLanguage(TextEditor::Language::Cpp());
+    editor_.SetReadOnlyEnabled(true);
+  }
+
+  auto type_name() const -> std::string_view override { return "ir.module"; }
+
+  auto render(const cc::any_value& value, cc::view_context&) -> void override {
+    const auto* mod = aa::any_cast<cc::ir::module>(&value);
+    if (!mod) {
+      ImGui::TextDisabled("view: value is not ir.module");
+      return;
+    }
+    std::string text;
+    for (auto const& instr : mod->code) {
+      switch (instr.op) {
+        case cc::ir::opcode::ret:
+          text += "ret " + std::to_string(instr.imm) + "\n";
+          break;
+      }
+    }
+    if (text.empty()) text = "(empty module)";
+    if (text != last_content_) {
+      editor_.SetText(text);
+      last_content_ = text;
+    }
+    if (g_state.mono_font) ImGui::PushFont(g_state.mono_font);
+    editor_.Render("##view_ir", ImVec2(0, 0), false);
+    if (g_state.mono_font) ImGui::PopFont();
+  }
+
+ private:
+  TextEditor  editor_;
+  std::string last_content_;
+};
+
+// ---------------------------------------------------------------------------
+// AST view renderer — walks cc::ast::tl_program via visitor and renders it
+// as an indented textual tree.
+// ---------------------------------------------------------------------------
+// Must match the producer plugin's spelling so aa::any_cast resolves the same
+// typeinfo (anchored in libcc-astit, shared across DSOs).
+using ast_value = std::shared_ptr<cc::ast::tl_program>;
+
+namespace ast_view_detail {
+
+// Builds a textual representation of the AST using the visitor double-dispatch.
+class stringifier final : public cc::ast::visitor {
+ public:
+  std::string text;
+
+  void visit(const cc::ast::program& p) override {
+    emit("program");
+    ++depth_;
+    for (auto const& s : p.body) {
+      if (s) s->accept(*this);
+    }
+    --depth_;
+  }
+  void visit(const cc::ast::return_stmt& r) override {
+    emit("return");
+    ++depth_;
+    if (r.value) r.value->accept(*this);
+    --depth_;
+  }
+  void visit(const cc::ast::int_literal& i) override {
+    emit("int " + std::to_string(i.value));
+  }
+
+ private:
+  void emit(std::string_view line) {
+    if (depth_ > 0) text += std::string(static_cast<size_t>(depth_) * 2, ' ');
+    text.append(line.data(), line.size());
+    text += '\n';
+  }
+  int depth_ = 0;
+};
+
+}  // namespace ast_view_detail
+
+class ast_view_renderer final : public cc::view_renderer {
+ public:
+  ast_view_renderer() {
+    editor_.SetPalette(TextEditor::GetDarkPalette());
+    editor_.SetLanguage(TextEditor::Language::Cpp());
+    editor_.SetReadOnlyEnabled(true);
+  }
+
+  auto type_name() const -> std::string_view override { return "tl.ast"; }
+
+  auto render(const cc::any_value& value, cc::view_context&) -> void override {
+    const auto* ast = aa::any_cast<ast_value>(&value);
+    if (!ast || !*ast || !(*ast)->root) {
+      ImGui::TextDisabled("view: value is not tl.ast (or empty)");
+      return;
+    }
+    ast_view_detail::stringifier s;
+    (*ast)->root->accept(s);
+    if (s.text != last_content_) {
+      editor_.SetText(s.text);
+      last_content_ = s.text;
+    }
+    if (g_state.mono_font) ImGui::PushFont(g_state.mono_font);
+    editor_.Render("##view_ast", ImVec2(0, 0), false);
     if (g_state.mono_font) ImGui::PopFont();
   }
 
@@ -527,14 +649,57 @@ void clear_graph() {
   log("graph cleared");
 }
 
+// Run the pipeline end-to-end: find an x86_64.assemble node, pull its "exe"
+// output (which transitively activates every upstream node), then chmod the
+// resulting path so it is directly executable.
+void run_pipeline() {
+  std::string target;
+  for (auto const& n : g_state.g.nodes()) {
+    if (n->type_id() == "x86_64.assemble") {
+      target = n->instance_id();
+      break;
+    }
+  }
+  if (target.empty()) {
+    log("run: no x86_64.assemble node in graph");
+    return;
+  }
+
+  log("run: pulling output 'exe' of " + target + " ...");
+  cc::runtime::runner r{g_state.g};
+  auto result = r.pull(target, "exe");
+  if (!result) {
+    log("run failed: " + result.error().what);
+    return;
+  }
+  const cc::any_value* out = *result;
+  if (!out || !out->has_value()) {
+    log("run: producer returned empty value");
+    return;
+  }
+  const auto* exe_path = aa::any_cast<std::string>(out);
+  if (!exe_path) {
+    log("run: 'exe' output is not a string path");
+    return;
+  }
+  log("run: built " + *exe_path);
+  if (std::system(("chmod +x " + *exe_path).c_str()) == 0) {
+    log("run: chmod +x ok — binary ready at " + *exe_path);
+  } else {
+    log("run: warning, chmod returned non-zero");
+  }
+}
+
 void draw_pipeline_canvas() {
   // ---- Canvas toolbar (per-tab actions) ----
   // These commands mutate the graph or the editor view — they belong to the
   // Pipeline tab, not the global menu. Navigate-style buttons set a flag
   // consumed inside ed::Begin/End below, where an editor context is current.
-  if (ImGui::Button("Zoom to Fit")) g_state.canvas_navigate_content = true;
+  if (ImGui::Button("Run"))           run_pipeline();
   ImGui::SameLine();
-  if (ImGui::Button("Clear"))       clear_graph();
+  if (ImGui::Button("Zoom to Fit"))   g_state.canvas_navigate_content = true;
+  ImGui::SameLine();
+  if (ImGui::Button("Clear"))         clear_graph();
   ImGui::SameLine();
   ImGui::TextDisabled("|  nodes: %zu   edges: %zu",
                       g_state.g.nodes().size(), g_state.g.edges().size());
@@ -554,8 +719,8 @@ void draw_pipeline_canvas() {
   }
 
   if (g_state.canvas_navigate_content) {
-    ed::NavigateToContent();
-    g_state.canvas_navigate_content = false;
+    // Defer until after nodes/links are rendered this frame, so the editor
+    // has up-to-date bounds to fit. Applied below, just before ed::End().
   }
 
   for (auto const& node_ptr : g_state.g.nodes()) {
@@ -701,6 +866,14 @@ void draw_pipeline_canvas() {
         std::to_string(static_cast<int>(canvas_pos.y)) + ") screen=(" +
         std::to_string(static_cast<int>(screen_pos.x)) + "," +
         std::to_string(static_cast<int>(screen_pos.y)) + ")");
+  }
+
+  // NavigateToContent needs the editor to know current node bounds, which
+  // only happens once nodes have been submitted this frame. Call it here,
+  // just before ed::End() — still inside ed::Begin/End so context is live.
+  if (g_state.canvas_navigate_content) {
+    ed::NavigateToContent();
+    g_state.canvas_navigate_content = false;
   }
 
   ed::End();
@@ -876,6 +1049,8 @@ void draw_status_bar() {
 int main() {
   g_state.host = cc::runtime::make_host_registry();
   g_state.host->renderers().register_renderer(std::make_unique<text_view_renderer>());
+  g_state.host->renderers().register_renderer(std::make_unique<ir_view_renderer>());
+  g_state.host->renderers().register_renderer(std::make_unique<ast_view_renderer>());
 
   std::size_t loaded = g_state.loader.load_all(*g_state.host);
   g_state.loaded_plugins = loaded;

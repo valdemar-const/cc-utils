@@ -142,7 +142,7 @@ struct AppState {
   // Pending SetNodePosition requests — collected when a node is created
   // outside ed::Begin/End (e.g. from the context menu), applied next frame
   // inside the editor context where ScreenToCanvas works.
-  struct pending_position { int ed_id; ImVec2 screen_pos; };
+  struct pending_position { int ed_id; ImVec2 canvas_pos; };
   std::vector<pending_position> pending_positions;
 
   // Fonts
@@ -352,7 +352,8 @@ void draw_property_widget(cc::node& n, const cc::property_desc& desc) {
 // ---------------------------------------------------------------------------
 struct create_menu_state {
   bool   open = false;
-  ImVec2 pos{};  // screen coords at right-click
+  ImVec2 pos{};         // absolute screen coords — for SetNextWindowPos
+  ImVec2 canvas_pos{};  // canvas-local coords — for ed::SetNodePosition
 };
 create_menu_state g_create_menu;
 
@@ -410,9 +411,9 @@ void draw_create_menu() {
           std::string instance{node->instance_id()};
           int ed_id = editor_id_for(instance);
           g_state.g.add_node(std::move(node));
-          // Position is applied next frame inside ed::Begin/End — ScreenToCanvas
-          // needs a current editor context, which we don't have here.
-          g_state.pending_positions.push_back({ed_id, g_create_menu.pos});
+          // Position is applied next frame inside ed::Begin/End —
+          // ed::SetNodePosition takes canvas-local coords.
+          g_state.pending_positions.push_back({ed_id, g_create_menu.canvas_pos});
           log("created " + std::string{f->type_id()} + " (instance=" + instance + ")");
           g_create_menu.open = false;
         }
@@ -510,10 +511,11 @@ void draw_pipeline_canvas() {
   ed::Begin("Pipeline Graph", ImVec2(0, ImGui::GetContentRegionAvail().y));
 
   // Apply deferred SetNodePosition requests from context-menu creations.
-  // ScreenToCanvas / SetNodePosition need a current editor.
+  // ed::SetNodePosition takes canvas-local coords (same coordinate space as
+  // ed::ScreenToCanvas output), and requires a current editor context.
   if (!g_state.pending_positions.empty()) {
     for (auto const& pp : g_state.pending_positions) {
-      ed::SetNodePosition(pp.ed_id, ed::ScreenToCanvas(pp.screen_pos));
+      ed::SetNodePosition(pp.ed_id, pp.canvas_pos);
     }
     g_state.pending_positions.clear();
   }
@@ -644,11 +646,23 @@ void draw_pipeline_canvas() {
   // that position. No Suspend/Resume, no ImGui::BeginPopup — keeps the
   // interaction contained inside the canvas.
   if (ed::ShowBackgroundContextMenu()) {
-    g_create_menu.open = true;
-    g_create_menu.pos  = ImGui::GetIO().MouseClickedPos[ImGuiMouseButton_Right];
-    log("popup click screen=(" +
-        std::to_string(static_cast<int>(g_create_menu.pos.x)) + "," +
-        std::to_string(static_cast<int>(g_create_menu.pos.y)) + ")");
+    // Inside ed::Begin/End, ImGui::GetIO().MouseClickedPos[] returns
+    // *canvas-local* coordinates (origin = canvas view center), not absolute
+    // screen coords. We need both:
+    //   - screen coords  → SetNextWindowPos for the menu window
+    //   - canvas coords  → ed::SetNodePosition for newly created nodes
+    // ed::CanvasToScreen does the conversion, but only while an editor
+    // context is current — so we must call it here, not after ed::End.
+    ImVec2 canvas_pos = ImGui::GetIO().MouseClickedPos[ImGuiMouseButton_Right];
+    ImVec2 screen_pos = ed::CanvasToScreen(canvas_pos);
+    g_create_menu.open       = true;
+    g_create_menu.pos        = screen_pos;
+    g_create_menu.canvas_pos = canvas_pos;
+    log("popup click canvas=(" +
+        std::to_string(static_cast<int>(canvas_pos.x)) + "," +
+        std::to_string(static_cast<int>(canvas_pos.y)) + ") screen=(" +
+        std::to_string(static_cast<int>(screen_pos.x)) + "," +
+        std::to_string(static_cast<int>(screen_pos.y)) + ")");
   }
 
   ed::End();

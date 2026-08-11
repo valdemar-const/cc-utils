@@ -80,17 +80,25 @@ cc-workbench (host UI)
 
 ## Дальнейшие шаги (по приоритету)
 
-1. **Фикс позиции context menu** (блокирует нормальный UX)
+1. **Фикс позиции context menu** (блокирует нормальный UX) — пробуем
+   `ed::CanvasToScreen(canvas_local)` внутри `ShowBackgroundContextMenu`.
 2. **Шаг 2A**: переписать `cc-plugin-tl` / `-tl-ir` / `-x86_64` под v3 node-API
    (frontend → ast → ir → bytes как узлы графа)
 3. **Шаг 2B**: переписать `ccp` CLI драйвер — build graph из 4 узлов
    (source/text.constant → tl.frontend → tl.irgen → x86_64.backend),
    проверить `return 42;` → exit 42 end-to-end
-4. **Шаг 3**: сохранение/загрузка `.pipeline` файла (graph + view layout),
+4. **Рефакторинг UI в Command pattern** — после шага 2, когда видно реальные
+   use cases. План: `std::variant<CreateNode, DeleteNode, CreateEdge,
+   DeleteEdge, SetProperty>` + одна `apply()` функция. UI кладёт в очередь,
+   main loop разгребает. Задел под undo/redo. UI-only действия (open menu,
+   select view) — отдельный UI state, НЕ команды. EventBus пока не вводим —
+   добавим если появится реальная потребность в реактивности (например,
+   runner invalidation при мутации графа).
+5. **Шаг 3**: сохранение/загрузка `.pipeline` файла (graph + view layout),
    on_save/on_load hooks (нужны json/xml/toml библиотеки)
-5. **Шаг 4**: toolbar с контекстными действиями выбранного узла
+6. **Шаг 4**: toolbar с контекстными действиями выбранного узла
    (IActionProvider). Например `Compile` для exec.out узла.
-6. **Шаг 5**: алгоритмическая генерация цветов типов (hash → palette с
+7. **Шаг 5**: алгоритмическая генерация цветов типов (hash → palette с
    contrast/uniqueness), замена хардкода `pin_color_for_type`
-7. **Шаг 6**: PIE menu как альтернатива popup
-8. **Шаг 7**: выкинуть `cc-pipeit` (старый v2 контракт) после полной миграции
+8. **Шаг 6**: PIE menu как альтернатива popup
+9. **Шаг 7**: выкинуть `cc-pipeit` (старый v2 контракт) после полной миграции

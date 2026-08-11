@@ -56,19 +56,19 @@ struct load_result {
 // normally happen — every node in `g` was created from a factory) are still
 // written with type_id but contribute no <requires> entry.
 //
-// `base_dir` (optional): if non-empty, every property whose schema kind is
-// `property_kind::path` is stored relative to this directory. Absolute paths
-// turn into `../sibling/file.txt`-style relatives when they live outside the
-// base_dir tree, and stay inside it otherwise. Empty values are skipped.
-// This makes the .pipeline file relocatable — copying the file alongside its
-// referenced inputs/outputs to another directory keeps the graph working.
+// Property values are written verbatim — no path relativisation, no
+// canonicalisation. Round-trip is identity-preserving: a relative path the
+// user typed stays relative on disk and after load; an absolute path stays
+// absolute. Relocatability is the user's responsibility (they choose whether
+// to type relative or absolute), and resolution of relative paths against the
+// pipeline's directory happens at activate() time via activate_context, not
+// at the storage layer.
 //
 // Returns an error string on I/O / serialisation failure; success is void.
 auto save_pipeline(const host_registry& host,
                    const runtime::graph& g,
                    const std::unordered_map<std::string, pos>& positions,
-                   const std::string& path,
-                   const std::string& base_dir = {}) -> std::expected<void, std::string>;
+                   const std::string& path) -> std::expected<void, std::string>;
 
 // Read a pipeline XML file into `g` (clears it first) and returns the
 // positions to restore + any soft warnings. Hard failures (file missing,
@@ -78,15 +78,12 @@ auto save_pipeline(const host_registry& host,
 // skipped nodes are also skipped. Both are reported in load_warnings so the
 // caller can surface them in a modal.
 //
-// `base_dir` (optional): the dual of save_pipeline's base_dir. Property
-// values whose schema kind is `property_kind::path` and that are relative
-// (no leading `/` or drive letter) get joined with base_dir to form an
-// absolute path before being stored on the node. Absolute values are stored
-// as-is. Pass `parent_path(path)` from the call site for the relocatable
-// round-trip to work.
+// Property values are stored verbatim (no path resolution): see save_pipeline
+// for the rationale. Resolution against the pipeline's directory is the
+// caller's job — typically done by constructing the runner with the right
+// pipeline_dir, which forwards it to every node's activate_context.
 auto load_pipeline(const host_registry& host,
                    runtime::graph& g,
-                   const std::string& path,
-                   const std::string& base_dir = {}) -> std::expected<load_result, std::string>;
+                   const std::string& path) -> std::expected<load_result, std::string>;
 
 }  // namespace cc::workbench

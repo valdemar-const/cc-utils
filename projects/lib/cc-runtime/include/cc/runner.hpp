@@ -28,7 +28,12 @@ class CC_RUNTIME_API runner {
  public:
   using log_callback = std::function<void(std::string_view)>;
 
-  explicit runner(graph& g, log_callback logger = {});
+  // `pipeline_dir` is forwarded to every activate() call via the
+  // activate_context, so nodes with path-typed properties can resolve
+  // relative entries against the .pipeline file's directory. Leave empty
+  // for unit tests or in-memory graphs that don't have a file on disk.
+  explicit runner(graph& g, log_callback logger = {},
+                  std::string pipeline_dir = {});
 
   // Pull value at (node_id, slot_id). Recursively activates upstream nodes.
   // Returns a pointer into the runner's cache (stable for the runner's
@@ -43,6 +48,7 @@ class CC_RUNTIME_API runner {
 
   graph&             g_;
   log_callback       logger_;
+  activate_context   ctx_;
   std::unordered_map<std::string, std::unordered_map<std::string, any_value>> cache_;
   std::unordered_set<std::string> completed_;
   std::unordered_set<std::string> in_progress_;

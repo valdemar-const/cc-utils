@@ -997,11 +997,10 @@ auto pipeline_display_name() -> std::string {
 // Run the load: parse XML, populate the graph, restore positions, surface
 // warnings/errors. Returns true on success.
 auto do_open_pipeline(const std::string& path) -> bool {
-  // Resolve relative path-typed properties against the pipeline's parent
-  // directory so the file is relocatable: copy file + inputs elsewhere and
-  // the graph still finds its assets.
-  std::string base_dir = std::filesystem::path(path).parent_path().string();
-  auto result = cc::workbench::load_pipeline(*g_state.host, g_state.g, path, base_dir);
+  // Property values round-trip verbatim — relative paths stay relative on
+  // disk and in the in-memory graph. Resolution against the pipeline's
+  // directory happens at activate() time via the runner's pipeline_dir.
+  auto result = cc::workbench::load_pipeline(*g_state.host, g_state.g, path);
   if (!result) {
     g_state.load_error_text = result.error();
     g_state.load_error_open = true;
@@ -1074,8 +1073,7 @@ auto do_save_pipeline(const std::string& path) -> bool {
       positions[id] = {it->second.x, it->second.y};
     }
   }
-  auto res = cc::workbench::save_pipeline(*g_state.host, g_state.g, positions, path,
-      /*base_dir=*/std::filesystem::path(path).parent_path().string());
+  auto res = cc::workbench::save_pipeline(*g_state.host, g_state.g, positions, path);
   if (!res) {
     g_state.load_error_text = res.error();
     g_state.load_error_open = true;
@@ -1221,9 +1219,15 @@ void run_pipeline() {
   }
 
   log("run: pulling output 'exe' of " + target + " ...");
+  // Forward the pipeline's directory so nodes with path properties can
+  // resolve relative entries against it (see activate_context).
+  std::string pipeline_dir;
+  if (!g_state.pipeline_path.empty()) {
+    pipeline_dir = std::filesystem::path(g_state.pipeline_path).parent_path().string();
+  }
   cc::runtime::runner r{g_state.g, [](std::string_view msg) {
     ::log(std::string{msg});
-  }};
+  }, pipeline_dir};
   auto result = r.pull(target, "exe");
   if (!result) {
     log("run failed: " + result.error().what);
@@ -1579,9 +1583,17 @@ void draw_view_window() {
     g_state.view_pull_future = std::async(
         std::launch::async,
         [target]() -> std::pair<std::string, std::optional<cc::any_value>> {
+          // View-tab pull shares the same pipeline_dir resolution as
+          // run_pipeline: the user's relative paths should open from the
+          // pipeline's directory, not from cwd.
+          std::string pipeline_dir;
+          if (!g_state.pipeline_path.empty()) {
+            pipeline_dir = std::filesystem::path(g_state.pipeline_path)
+                              .parent_path().string();
+          }
           cc::runtime::runner r{g_state.g, [](std::string_view msg) {
             ::log(std::string{msg});
-          }};
+          }, pipeline_dir};
           auto result = r.pull(target, "in");
           if (!result) {
             return {result.error().what, std::nullopt};

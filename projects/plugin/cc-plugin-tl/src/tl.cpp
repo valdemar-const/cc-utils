@@ -95,7 +95,8 @@ class frontend_node final : public node {
   auto properties() -> node_properties& override { return props_; }
 
   auto activate(std::span<const input_pair>  inputs,
-                std::span<output_pair>       outputs) -> activate_result override {
+                std::span<output_pair>       outputs,
+                const activate_context&      /*ctx*/) -> activate_result override {
     // Pull the "src" input.
     const std::string* src_text = nullptr;
     for (auto [slot_id, value] : inputs) {

@@ -7,7 +7,8 @@
 
 namespace cc::runtime {
 
-runner::runner(graph& g, log_callback logger) : g_{g}, logger_{std::move(logger)} {}
+runner::runner(graph& g, log_callback logger, std::string pipeline_dir)
+    : g_{g}, logger_{std::move(logger)}, ctx_{std::move(pipeline_dir)} {}
 
 auto runner::pull(std::string_view node_id, std::string_view slot_id)
     -> std::expected<const any_value*, failure> {
@@ -98,7 +99,7 @@ auto runner::ensure_outputs(std::string_view node_id) -> std::expected<void, fai
   // 3. Activate. Hand the node a logger sink so its diagnostic messages
   //    flow into the host's Logger tab (thread-safe on the host side).
   n->set_logger(logger_);
-  auto result = n->activate(inputs, outputs);
+  auto result = n->activate(inputs, outputs, ctx_);
   n->set_logger({});  // detach — node should not log outside activate
   if (!result) {
     in_progress_.erase(key);

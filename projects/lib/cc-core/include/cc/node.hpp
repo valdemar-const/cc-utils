@@ -56,6 +56,21 @@ using input_pair  = std::pair<std::string_view, const any_value*>;
 using output_pair = std::pair<std::string_view, any_value*>;
 using activate_result = std::expected<void, failure>;
 
+// Per-activation runtime context. The runner constructs one before each
+// activate() call and passes it to the node alongside the inputs/outputs.
+//
+// `pipeline_dir` is the absolute directory of the .pipeline file currently
+// loaded in the host (empty when no file is open — e.g. unit tests, or when
+// the graph was built in-memory). Nodes that accept filesystem paths in
+// their properties SHOULD resolve relative paths against this directory
+// inside activate(); absolute paths are taken verbatim. Storing the raw
+// property string (which the user typed) but resolving at activation time
+// keeps the .pipeline file's text identical to what the user entered —
+// round-trip preserves the original spelling, including relative paths.
+struct CC_CORE_API activate_context {
+  std::string pipeline_dir;
+};
+
 // One node in the graph. Subclassed by plugins.
 //
 // The host/runner owns activation timing; a node only declares its slots,
@@ -77,8 +92,13 @@ class CC_CORE_API node {
   // value (pull-based), calls activate; the node populates each declared output
   // slot's any_value* in place. Failure → runner surfaces the diagnostic and
   // stops downstream evaluation.
+  //
+  // `ctx` carries host-side runtime information (currently: the pipeline's
+  // parent directory, so nodes with filesystem paths can resolve relative
+  // entries against it). Nodes that don't need it simply ignore the param.
   virtual auto activate(std::span<const input_pair>  inputs,
-                         std::span<output_pair>       outputs) -> activate_result = 0;
+                         std::span<output_pair>       outputs,
+                         const activate_context&      ctx) -> activate_result = 0;
 
   // ---- Diagnostic logging -------------------------------------------------
   // Logger is set by the runner just before activate() and cleared after.

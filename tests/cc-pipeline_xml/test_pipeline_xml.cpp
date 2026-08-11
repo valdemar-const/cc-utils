@@ -324,125 +324,114 @@ TEST_F(pipeline_xml_fixture, save_clear_load_run_produces_42) {
   std::filesystem::remove(exe_path, rm);
 }
 
-// ----- relocatable: absolute path-typed properties are stored relative -----
+// ----- round-trip is verbatim: relative stays relative, absolute stays absolute -----
 
-TEST_F(pipeline_xml_fixture, save_writes_path_property_relative_to_base_dir) {
+TEST_F(pipeline_xml_fixture, save_preserves_relative_path_verbatim) {
   cc::runtime::graph g;
   std::string id = add_node(g, "basic.text.from_file");
+  // A user-typed relative path: must stay exactly this string through save
+  // and load — resolution against the pipeline's directory is activate()'s
+  // job, not the storage layer's.
+  g.find_node(id)->properties().set("path", "./input.txt");
 
-  // Construct an absolute path that lives under base_dir.
-  auto base_dir = std::filesystem::temp_directory_path() / "cc_xml_reloc_src";
-  std::filesystem::create_directories(base_dir);
-  auto input_under = base_dir / "src.txt";
-  write_file(input_under.string(), "hello");
+  auto tmp = std::filesystem::temp_directory_path() / "cc_xml_verbatim_rel.pipeline";
+  ASSERT_TRUE(cw::save_pipeline(*host_, g, {}, tmp.string()).has_value());
 
-  g.find_node(id)->properties().set("path", input_under.string());
-
-  auto tmp = base_dir / "graph.pipeline";
-  ASSERT_TRUE(cw::save_pipeline(*host_, g, {}, tmp.string(),
-                                 /*base_dir=*/base_dir.string()).has_value());
-
-  // Read the XML back as text and confirm the path is stored relative
-  // (the canonical "lives in the same tree" case becomes just the filename).
-  // We can't just substring-match `<property key="path">src.txt</property>`
-  // because pugixml's format_indent_attributes puts the attribute on its own
-  // line; check the closing tag instead and verify no absolute-path prefix
-  // leaks through.
+  // On-disk form: the relative path is written verbatim.
   std::ifstream is{tmp};
   ASSERT_TRUE(is.good());
   std::string xml((std::istreambuf_iterator<char>(is)),
                    std::istreambuf_iterator<char>());
-  EXPECT_NE(xml.find(">src.txt</property>"), std::string::npos)
-      << "expected stored path to be relative; XML was:\n"
-      << xml;
-  // Sanity: the absolute prefix of the input path must NOT appear in the
-  // file — if it does, save didn't relativise.
-  EXPECT_EQ(xml.find(input_under.parent_path().string()), std::string::npos)
-      << "absolute directory leaked into stored path; XML was:\n"
-      << xml;
-}
+  EXPECT_NE(xml.find(">./input.txt</property>"), std::string::npos)
+      << "expected stored path verbatim; XML was:\n" << xml;
 
-TEST_F(pipeline_xml_fixture, outside_base_dir_uses_dotdot_relative) {
-  cc::runtime::graph g;
-  std::string id = add_node(g, "basic.text.from_file");
-
-  // base_dir is a sibling of input_path's parent.
-  auto root = std::filesystem::temp_directory_path() / "cc_xml_reloc_outside";
-  std::filesystem::remove_all(root);
-  auto input_dir   = root / "inputs";
-  auto pipeline_dir = root / "pipelines";
-  std::filesystem::create_directories(input_dir);
-  std::filesystem::create_directories(pipeline_dir);
-  auto input_path = input_dir / "in.txt";
-  write_file(input_path.string(), "x");
-  auto tmp = pipeline_dir / "graph.pipeline";
-
-  g.find_node(id)->properties().set("path", input_path.string());
-  ASSERT_TRUE(cw::save_pipeline(*host_, g, {}, tmp.string(),
-                                 /*base_dir=*/pipeline_dir.string()).has_value());
-
-  // Load with base_dir = the directory we saved into; we should get back the
-  // same absolute path, regardless of how it was stored.
+  // Round-trip through load: the in-memory property string is identical to
+  // what the user typed. No expansion, no canonicalisation.
   cc::runtime::graph g2;
-  auto load = cw::load_pipeline(*host_, g2, tmp.string(),
-                                 /*base_dir=*/pipeline_dir.string());
+  auto load = cw::load_pipeline(*host_, g2, tmp.string());
   ASSERT_TRUE(load.has_value()) << load.error();
   ASSERT_EQ(g2.nodes().size(), 1u);
-  std::string restored{g2.nodes()[0]->properties().get("path")};
-  EXPECT_EQ(std::filesystem::path(restored), input_path)
-      << "expected round-trip to recover the original absolute path; got "
-      << restored;
-
-  std::error_code ec;
-  std::filesystem::remove_all(root, ec);
+  EXPECT_EQ(std::string{g2.nodes()[0]->properties().get("path")}, "./input.txt");
 }
 
-// ----- the relocatable payoff: move file + assets, paths still resolve -----
+TEST_F(pipeline_xml_fixture, save_preserves_absolute_path_verbatim) {
+  cc::runtime::graph g;
+  std::string id = add_node(g, "basic.text.from_file");
+  std::string abs_path =
+      (std::filesystem::temp_directory_path() / "cc_xml_abs_input.txt").string();
+  g.find_node(id)->properties().set("path", abs_path);
 
-TEST_F(pipeline_xml_fixture, moving_pipeline_keeps_paths_working) {
-  // Build the source pipeline in src_dir.
-  auto root = std::filesystem::temp_directory_path() / "cc_xml_reloc_move";
+  auto tmp = std::filesystem::temp_directory_path() / "cc_xml_verbatim_abs.pipeline";
+  ASSERT_TRUE(cw::save_pipeline(*host_, g, {}, tmp.string()).has_value());
+
+  cc::runtime::graph g2;
+  auto load = cw::load_pipeline(*host_, g2, tmp.string());
+  ASSERT_TRUE(load.has_value()) << load.error();
+  ASSERT_EQ(g2.nodes().size(), 1u);
+  EXPECT_EQ(std::string{g2.nodes()[0]->properties().get("path")}, abs_path)
+      << "absolute path must round-trip unchanged";
+}
+
+// ----- relocatable payoff: the same file works from two different directories -----
+//
+// The .pipeline file stores `./source.txt`. We copy file + input into a
+// second directory, load from there, and ask the runner to activate. The
+// node resolves `./source.txt` against the *destination* pipeline_dir
+// (forwarded via runner constructor), reading the destination's copy. This
+// is the "no surprise" UX: the property text stays what the user typed, and
+// the right thing happens at runtime.
+
+TEST_F(pipeline_xml_fixture, runner_resolves_relative_path_via_pipeline_dir) {
+  auto root = std::filesystem::temp_directory_path() / "cc_xml_runner_resolve";
   std::filesystem::remove_all(root);
   auto src_dir = root / "src";
   auto dst_dir = root / "dst";
   std::filesystem::create_directories(src_dir);
   std::filesystem::create_directories(dst_dir);
 
-  // A text input that the graph references.
+  // Place a different content in each directory's source.txt — that way we
+  // can tell which one the runner actually read.
   auto src_input = src_dir / "source.txt";
-  write_file(src_input.string(), "data");
+  auto dst_input = dst_dir / "source.txt";
+  write_file(src_input.string(), "from_src");
+  write_file(dst_input.string(), "from_dst");
 
   cc::runtime::graph g;
   std::string id = add_node(g, "basic.text.from_file");
-  g.find_node(id)->properties().set("path", src_input.string());
+  g.find_node(id)->properties().set("path", "./source.txt");  // relative — user's choice
 
   auto src_pipeline = src_dir / "graph.pipeline";
-  ASSERT_TRUE(cw::save_pipeline(*host_, g, {}, src_pipeline.string(),
-                                 /*base_dir=*/src_dir.string()).has_value());
+  ASSERT_TRUE(cw::save_pipeline(*host_, g, {}, src_pipeline.string()).has_value());
 
-  // Copy the pipeline file and its referenced asset into dst_dir preserving
-  // the relative layout (the file itself sits next to source.txt in both).
+  // Copy into dst. The .pipeline file is byte-identical (so the property text
+  // is still "./source.txt" — round-trip preserves it), and source.txt comes
+  // along for the ride.
   std::filesystem::copy_file(src_pipeline, dst_dir / "graph.pipeline",
                               std::filesystem::copy_options::overwrite_existing);
-  std::filesystem::copy_file(src_input,    dst_dir / "source.txt",
-                              std::filesystem::copy_options::overwrite_existing);
 
-  // Now load from the *destination* location. The stored path is "source.txt"
-  // (relative); the loader resolves it against dst_dir, so the absolute path
-  // we get back points at dst_dir / "source.txt", not src_dir / "source.txt".
+  // Load from dst_dir — the in-memory property is still "./source.txt".
   cc::runtime::graph g2;
   auto dst_pipeline = dst_dir / "graph.pipeline";
-  auto load = cw::load_pipeline(*host_, g2, dst_pipeline.string(),
-                                 /*base_dir=*/dst_dir.string());
+  auto load = cw::load_pipeline(*host_, g2, dst_pipeline.string());
   ASSERT_TRUE(load.has_value()) << load.error();
   ASSERT_EQ(g2.nodes().size(), 1u);
-  std::string restored{g2.nodes()[0]->properties().get("path")};
-  EXPECT_EQ(std::filesystem::path(restored), dst_dir / "source.txt")
-      << "relocatable load should resolve to the destination copy, not the "
-      << "original source path; got " << restored;
+  EXPECT_EQ(std::string{g2.nodes()[0]->properties().get("path")}, "./source.txt")
+      << "round-trip must preserve the relative text the user typed";
 
-  // Sanity: the file at the restored path must actually exist.
-  EXPECT_TRUE(std::filesystem::exists(restored));
+  // Now pull. The runner constructed with pipeline_dir = dst_dir resolves
+  // "./source.txt" against dst_dir, so the node reads dst_dir/source.txt and
+  // emits "from_dst" — NOT src_dir/source.txt.
+  std::string loaded_id{g2.nodes()[0]->instance_id()};
+  cc::runtime::runner r{g2, {}, dst_dir.string()};
+  auto result = r.pull(loaded_id, "out");
+  ASSERT_TRUE(result.has_value()) << result.error().what;
+  const cc::any_value* v = *result;
+  ASSERT_NE(v, nullptr);
+  const auto* s = aa::any_cast<std::string>(v);
+  ASSERT_NE(s, nullptr);
+  EXPECT_EQ(*s, "from_dst")
+      << "runner with pipeline_dir=dst must resolve relative paths against "
+      << "dst_dir, not the cwd or the original src_dir";
 
   std::error_code ec;
   std::filesystem::remove_all(root, ec);

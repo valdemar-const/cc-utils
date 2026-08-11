@@ -114,12 +114,23 @@ class from_file_node final : public node {
   auto properties() -> node_properties& override { return props_; }
 
   auto activate(std::span<const input_pair>,
-                std::span<output_pair>      outputs) -> activate_result override {
+                std::span<output_pair>      outputs,
+                const activate_context&     ctx) -> activate_result override {
     std::string raw{props_.get("path")};
     if (raw.empty()) {
       return std::unexpected(failure{"'path' not set"});
     }
-    std::filesystem::path path(raw);
+    // Resolve relative paths against the pipeline's parent directory so the
+    // .pipeline file is relocatable: the user types `./test.tl`, save/load
+    // preserve the text verbatim, and the file resolves to a different
+    // absolute path depending on where the .pipeline file was opened from.
+    // Absolute paths are taken verbatim. Empty pipeline_dir (in-memory graph,
+    // unit tests) → leave the string as-is, std::ifstream resolves against
+    // the process working directory.
+    std::filesystem::path path{raw};
+    if (!path.is_absolute() && !ctx.pipeline_dir.empty()) {
+      path = std::filesystem::path{ctx.pipeline_dir} / path;
+    }
     log("from_file[" + id_ + "]: opening " + path.string());
     std::ifstream in(path);
     if (!in) {
@@ -189,7 +200,8 @@ class constant_node final : public node {
   auto properties() -> node_properties& override { return props_; }
 
   auto activate(std::span<const input_pair>,
-                std::span<output_pair> outputs) -> activate_result override {
+                std::span<output_pair> outputs,
+                const activate_context& /*ctx*/) -> activate_result override {
     std::string value{props_.get("value")};
     log("text.constant[" + id_ + "]: emitting " + std::to_string(value.size()) + " bytes");
     for (auto& [slot_id, out] : outputs) {
@@ -249,7 +261,8 @@ class view_node final : public node {
 
   // Sinks; the View panel pulls upstream value directly via the runner.
   auto activate(std::span<const input_pair>,
-                std::span<output_pair>) -> activate_result override {
+                std::span<output_pair>,
+                const activate_context& /*ctx*/) -> activate_result override {
     return {};
   }
 
@@ -356,7 +369,8 @@ class exec_node final : public node {
   auto properties() -> node_properties& override { return props_; }
 
   auto activate(std::span<const input_pair>  inputs,
-                std::span<output_pair>       outputs) -> activate_result override {
+                std::span<output_pair>       outputs,
+                const activate_context&      /*ctx*/) -> activate_result override {
     const std::filesystem::path* exe_p = nullptr;
     const std::string* args_s = nullptr;
     for (auto [slot_id, value] : inputs) {

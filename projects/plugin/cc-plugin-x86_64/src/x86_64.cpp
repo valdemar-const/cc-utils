@@ -111,7 +111,8 @@ class nasm_gen_node final : public node {
   auto properties() -> node_properties& override { return props_; }
 
   auto activate(std::span<const input_pair>  inputs,
-                std::span<output_pair>       outputs) -> activate_result override {
+                std::span<output_pair>       outputs,
+                const activate_context&      /*ctx*/) -> activate_result override {
     const cc::ir::module* mod = nullptr;
     for (auto [slot_id, value] : inputs) {
       if (slot_id == "ir" && value != nullptr) {
@@ -178,7 +179,8 @@ class assemble_node final : public node {
   auto properties() -> node_properties& override { return props_; }
 
   auto activate(std::span<const input_pair>  inputs,
-                std::span<output_pair>       outputs) -> activate_result override {
+                std::span<output_pair>       outputs,
+                const activate_context&      ctx) -> activate_result override {
     const std::string* asm_text = nullptr;
     for (auto [slot_id, value] : inputs) {
       if (slot_id == "asm" && value != nullptr) {
@@ -194,7 +196,13 @@ class assemble_node final : public node {
     if (raw_out.empty()) {
       return std::unexpected(failure{"'out_path' property not set"});
     }
+    // Resolve relative out_path against the pipeline's directory (same rule
+    // as basic.text.from_file): the property text round-trips verbatim
+    // through save/load; resolution happens here, at activation time.
     std::filesystem::path exe(raw_out);
+    if (!exe.is_absolute() && !ctx.pipeline_dir.empty()) {
+      exe = std::filesystem::path{ctx.pipeline_dir} / exe;
+    }
     std::filesystem::path asm_path = exe;
     asm_path += ".asm";
     std::filesystem::path obj_path = exe;

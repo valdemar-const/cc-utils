@@ -26,7 +26,6 @@ class CC_RUNTIME_API plugin_loader {
   //   2. directory of the running executable
   //   3. <exe dir>/../lib
   //   4. "."
-  // Same convention as cc-pipeit.
   static auto default_search_dirs() -> std::vector<std::string>;
 
   // Open `cc-plugin-<name>.so` from any search dir, version-check, register.

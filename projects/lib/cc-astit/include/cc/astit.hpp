@@ -2,8 +2,6 @@
 
 #include "cc-astit_export.hpp"
 
-#include <cc/any_ast.hpp>
-
 #include <cstdint>
 #include <memory>
 #include <string_view>
@@ -50,12 +48,13 @@ struct CC_ASTIT_API visitor {
   virtual void visit(const int_literal&) {}
 };
 
-// Concrete carrier for "tl"-language ASTs. The tl frontend wraps its parsed
-// cc::ast::program here; the tl ir_generator downcasts back. Lives in cc-astit
-// so both tl plugins share tl_program's typeinfo for the cross-DSO dynamic_cast.
-struct CC_ASTIT_API tl_program : cc::IAnyAst {
+// Concrete carrier for "tl"-language ASTs. The tl frontend plugin wraps its
+// parsed cc::ast::program here; the tl irgen plugin casts back through
+// shared_ptr<tl_program> (the v3 wire type). Lives in cc-astit so both tl
+// plugins share tl_program's typeinfo across the DSO boundary via AnyAny.
+struct CC_ASTIT_API tl_program {
   std::unique_ptr<program> root;
-  ~tl_program() override;
+  ~tl_program();
 };
 
 }  // namespace cc::ast

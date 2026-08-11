@@ -1,13 +1,5 @@
 #include "cc/astit.hpp"
 
-namespace cc {
-
-// Key function for IAnyAst: anchors its typeinfo + vtable in libcc-astit and
-// (with CC_ASTIT_API) exports them, so dynamic_cast across DSOs succeeds.
-IAnyAst::~IAnyAst() = default;
-
-}  // namespace cc
-
 namespace cc::astit {
 
 std::string_view version() noexcept {

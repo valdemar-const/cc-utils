@@ -34,10 +34,8 @@ TEST(cc_astit, build_and_traverse) {
   EXPECT_EQ(v.lits, 1);
 }
 
-TEST(cc_astit, tl_program_downcasts_from_anyast) {
+TEST(cc_astit, tl_program_holds_program) {
   auto carrier = std::make_unique<cc::ast::tl_program>();
   carrier->root = std::make_unique<cc::ast::program>();
-  cc::IAnyAst* erased = carrier.get();
-  auto* back = dynamic_cast<cc::ast::tl_program*>(erased);
-  EXPECT_NE(back, nullptr);
+  EXPECT_NE(carrier->root, nullptr);
 }

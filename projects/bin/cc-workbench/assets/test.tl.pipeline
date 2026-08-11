@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<pipeline
+  version="1">
+  <requires>
+    <plugin
+      name="basic" />
+    <plugin
+      name="tl" />
+    <plugin
+      name="tl-ir" />
+    <plugin
+      name="x86_64" />
+  </requires>
+  <nodes>
+    <node
+      type="basic.text.from_file"
+      id="basic.text.from_file#1">
+      <pos
+        x="-316"
+        y="124" />
+      <properties>
+        <property
+          key="path">./test.tl</property>
+      </properties>
+    </node>
+    <node
+      type="tl.frontend"
+      id="tl.frontend#117">
+      <pos
+        x="156"
+        y="124" />
+      <properties />
+    </node>
+    <node
+      type="tl.irgen"
+      id="tl.irgen#213">
+      <pos
+        x="447"
+        y="124" />
+      <properties />
+    </node>
+    <node
+      type="x86_64.nasm_gen"
+      id="x86_64.nasm_gen#555">
+      <pos
+        x="766"
+        y="124" />
+      <properties />
+    </node>
+    <node
+      type="x86_64.assemble"
+      id="x86_64.assemble#706">
+      <pos
+        x="1129"
+        y="124" />
+      <properties>
+        <property
+          key="out_path">./out</property>
+      </properties>
+    </node>
+    <node
+      type="basic.exec"
+      id="basic.exec#1685">
+      <pos
+        x="1752"
+        y="126" />
+      <properties>
+        <property
+          key="merge_stderr">false</property>
+      </properties>
+    </node>
+    <node
+      type="basic.view"
+      id="basic.view#2030">
+      <pos
+        x="2408"
+        y="124" />
+      <properties>
+        <property
+          key="name">view</property>
+      </properties>
+    </node>
+  </nodes>
+  <edges>
+    <edge
+      src_node="basic.text.from_file#1"
+      src_slot="out"
+      dst_node="tl.frontend#117"
+      dst_slot="src" />
+    <edge
+      src_node="tl.frontend#117"
+      src_slot="ast"
+      dst_node="tl.irgen#213"
+      dst_slot="ast" />
+    <edge
+      src_node="tl.irgen#213"
+      src_slot="ir"
+      dst_node="x86_64.nasm_gen#555"
+      dst_slot="ir" />
+    <edge
+      src_node="x86_64.nasm_gen#555"
+      src_slot="asm"
+      dst_node="x86_64.assemble#706"
+      dst_slot="asm" />
+    <edge
+      src_node="x86_64.assemble#706"
+      src_slot="exe"
+      dst_node="basic.exec#1685"
+      dst_slot="exe" />
+    <edge
+      src_node="basic.exec#1685"
+      src_slot="ret_code"
+      dst_node="basic.view#2030"
+      dst_slot="in" />
+  </edges>
+</pipeline>

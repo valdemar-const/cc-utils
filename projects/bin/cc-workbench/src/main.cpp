@@ -997,7 +997,11 @@ auto pipeline_display_name() -> std::string {
 // Run the load: parse XML, populate the graph, restore positions, surface
 // warnings/errors. Returns true on success.
 auto do_open_pipeline(const std::string& path) -> bool {
-  auto result = cc::workbench::load_pipeline(*g_state.host, g_state.g, path);
+  // Resolve relative path-typed properties against the pipeline's parent
+  // directory so the file is relocatable: copy file + inputs elsewhere and
+  // the graph still finds its assets.
+  std::string base_dir = std::filesystem::path(path).parent_path().string();
+  auto result = cc::workbench::load_pipeline(*g_state.host, g_state.g, path, base_dir);
   if (!result) {
     g_state.load_error_text = result.error();
     g_state.load_error_open = true;
@@ -1070,7 +1074,8 @@ auto do_save_pipeline(const std::string& path) -> bool {
       positions[id] = {it->second.x, it->second.y};
     }
   }
-  auto res = cc::workbench::save_pipeline(*g_state.host, g_state.g, positions, path);
+  auto res = cc::workbench::save_pipeline(*g_state.host, g_state.g, positions, path,
+      /*base_dir=*/std::filesystem::path(path).parent_path().string());
   if (!res) {
     g_state.load_error_text = res.error();
     g_state.load_error_open = true;

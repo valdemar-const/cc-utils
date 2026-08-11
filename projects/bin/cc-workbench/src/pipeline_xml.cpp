@@ -47,6 +47,45 @@ auto parse_float_attr(const pugi::xml_attribute& a, float& out) -> bool {
 }
 
 // --------------------------------------------------------------------------
+// Path relocation helpers — make the .pipeline file portable across
+// directories by storing path-typed properties relative to the file's parent
+// directory. On load we resolve them back to absolute. Defined early because
+// write_nodes (save) and read_properties (load) both reference them.
+// --------------------------------------------------------------------------
+
+// Save side: if base_dir is non-empty and value is absolute, return the
+// path expressed relative to base_dir (`../sibling/file.txt`-style).
+// Relative or empty values pass through untouched, so a value the user
+// already typed as relative round-trips verbatim.
+auto relative_to_base(std::string_view value, const std::string& base_dir) -> std::string {
+  if (base_dir.empty() || value.empty()) return std::string{value};
+  std::filesystem::path p(value);
+  if (!p.is_absolute()) return std::string{value};
+  std::error_code ec;
+  // proximate = lexically_relative with ".." up-walking, no symlink resolution
+  // (we don't want to hit the filesystem at save time — the file may have been
+  // moved before Save and the absolute path may briefly not exist).
+  auto rel = std::filesystem::proximate(p, base_dir, ec);
+  if (ec) return std::string{value};
+  return rel.string();
+}
+
+// Load side: if base_dir is non-empty and value is relative, join it with
+// base_dir and normalise. Absolute / empty values pass through untouched.
+// We use weakly_canonical so the result has no `..` segments left, but we
+// fall back to plain operator/ if the target doesn't exist (weakly_canonical
+// requires existence on some stdlib implementations).
+auto resolve_under_base(std::string_view value, const std::string& base_dir) -> std::string {
+  if (base_dir.empty() || value.empty()) return std::string{value};
+  std::filesystem::path p(value);
+  if (p.is_absolute()) return std::string{value};
+  std::error_code ec;
+  auto abs = std::filesystem::weakly_canonical(base_dir / p, ec);
+  if (ec) return (std::filesystem::path{base_dir} / p).string();
+  return abs.string();
+}
+
+// --------------------------------------------------------------------------
 // <requires> — unique set of plugin providers for every node type in the graph.
 // --------------------------------------------------------------------------
 auto collect_required_plugins(const host_registry& host, const runtime::graph& g)
@@ -73,7 +112,8 @@ auto write_requires(pugi::xml_node root, const std::vector<std::string>& plugins
 auto write_nodes(pugi::xml_node root,
                  const host_registry& host,
                  const runtime::graph& g,
-                 const std::unordered_map<std::string, pos>& positions) -> void {
+                 const std::unordered_map<std::string, pos>& positions,
+                 const std::string& base_dir) -> void {
   auto nodes = root.append_child("nodes");
   for (auto const& n : g.nodes()) {
     auto node_el = nodes.append_child("node");
@@ -92,10 +132,16 @@ auto write_nodes(pugi::xml_node root,
     // the UI shows (no internal fields leaking, no missing fields).
     if (auto* f = host.find_node_factory(n->type_id())) {
       for (auto const& desc : f->property_schema()) {
-        std::string_view value = n->properties().get(desc.key);
+        std::string value{n->properties().get(desc.key)};
+        // Relocate path-typed values relative to base_dir so the .pipeline
+        // file stays portable: copying file + inputs to another directory
+        // keeps the graph working without editing properties.
+        if (desc.kind == cc::property_kind::path) {
+          value = relative_to_base(value, base_dir);
+        }
         auto prop_el = props_el.append_child("property");
         append_attribute(prop_el, "key", desc.key);
-        prop_el.append_child(pugi::node_pcdata).set_value(std::string{value}.c_str());
+        prop_el.append_child(pugi::node_pcdata).set_value(value.c_str());
       }
     }
   }
@@ -158,9 +204,22 @@ auto read_positions(const pugi::xml_node& node_el, const std::string& instance_i
   if (ok_x && ok_y) out[instance_id] = p;
 }
 
-auto read_properties(const pugi::xml_node& node_el, cc::node& n) -> void {
+auto read_properties(const pugi::xml_node& node_el,
+                     cc::node& n,
+                     const cc::node_factory* factory,
+                     const std::string& base_dir) -> void {
   auto props_el = node_el.child("properties");
   if (!props_el) return;
+  // Build a quick lookup of which keys are path-typed for this node so we can
+  // resolve relative paths against base_dir on the load side. If factory is
+  // null (unknown type), we skipped the node earlier and never get here — but
+  // be defensive: treat all values as plain strings when schema is missing.
+  std::set<std::string_view> path_keys;
+  if (factory) {
+    for (auto const& desc : factory->property_schema()) {
+      if (desc.kind == cc::property_kind::path) path_keys.insert(desc.key);
+    }
+  }
   for (auto prop = props_el.child("property"); prop; prop = prop.next_sibling("property")) {
     auto key = prop.attribute("key").value();
     if (!key || !*key) continue;
@@ -170,7 +229,11 @@ auto read_properties(const pugi::xml_node& node_el, cc::node& n) -> void {
     if (auto pcdata = prop.first_child(); pcdata && pcdata.type() == pugi::node_pcdata) {
       value = pcdata.value();
     }
-    n.properties().set(key, value);
+    std::string resolved{value};
+    if (path_keys.contains(key)) {
+      resolved = resolve_under_base(resolved, base_dir);
+    }
+    n.properties().set(key, resolved);
   }
 }
 
@@ -183,7 +246,8 @@ auto read_properties(const pugi::xml_node& node_el, cc::node& n) -> void {
 auto save_pipeline(const host_registry& host,
                    const runtime::graph& g,
                    const std::unordered_map<std::string, pos>& positions,
-                   const std::string& path) -> std::expected<void, std::string> {
+                   const std::string& path,
+                   const std::string& base_dir) -> std::expected<void, std::string> {
   pugi::xml_document doc;
   auto decl = doc.prepend_child(pugi::node_declaration);
   decl.append_attribute("version") = "1.0";
@@ -197,7 +261,7 @@ auto save_pipeline(const host_registry& host,
   }
 
   write_requires(root, collect_required_plugins(host, g));
-  write_nodes   (root, host, g, positions);
+  write_nodes   (root, host, g, positions, base_dir);
   write_edges   (root, g);
 
   // pretty_print writes to a std::ofstream-compatible stream; raw save_file
@@ -217,7 +281,8 @@ auto save_pipeline(const host_registry& host,
 
 auto load_pipeline(const host_registry& host,
                    runtime::graph& g,
-                   const std::string& path) -> std::expected<load_result, std::string> {
+                   const std::string& path,
+                   const std::string& base_dir) -> std::expected<load_result, std::string> {
   if (!std::filesystem::exists(path)) {
     return std::unexpected<std::string>("file not found: " + path);
   }
@@ -282,7 +347,7 @@ auto load_pipeline(const host_registry& host,
             std::string{type_id} + " (instance " + inst_id + "): create_with_id returned null");
         continue;
       }
-      read_properties(node_el, *n);
+      read_properties(node_el, *n, f, base_dir);
       read_positions(node_el, inst_id, lr.positions);
       created_ids.emplace(inst_id);
       g.add_node(std::move(n));

@@ -20,7 +20,7 @@
         y="124" />
       <properties>
         <property
-          key="path">./test.tl</property>
+          key="path">./examples/42_answer.tl</property>
       </properties>
     </node>
     <node

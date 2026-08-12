@@ -12,6 +12,7 @@
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/readable_pipe.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/writable_pipe.hpp>
 #include <boost/process/v2/process.hpp>
 #include <boost/process/v2/stdio.hpp>
@@ -39,11 +40,11 @@ std::vector<std::string> split_args(std::string_view args)
     return v;
 }
 
-std::string drain(asio::readable_pipe &p)
+std::string drain(boost::asio::readable_pipe &p)
 {
     std::string              out;
     boost::system::error_code ec;
-    asio::read(p, asio::dynamic_buffer(out), ec);
+    boost::asio::read(p, boost::asio::dynamic_buffer(out), ec);
     return out;
 }
 
@@ -91,10 +92,26 @@ basic_executor<linux_tag>::exec(std::string_view        exe,
 
     if (timeout_ms)
     {
-        if (!child.wait_for(std::chrono::milliseconds(*timeout_ms)))
+        asio::steady_timer timer(ctx, std::chrono::milliseconds(*timeout_ms));
+        bool timed_out = false;
+
+        child.async_wait([&timer](boost::system::error_code ec, int /*exit_code*/) {
+            if (!ec)
+                timer.cancel();
+        });
+        timer.async_wait([&](boost::system::error_code ec) {
+            if (!ec)
+            {
+                timed_out = true;
+                boost::system::error_code tec;
+                child.terminate(tec);
+            }
+        });
+        ctx.run();
+
+        if (timed_out)
         {
-            child.terminate();
-            child.wait();
+            child.wait(ec);
             return std::unexpected(exec_error {"timeout", true});
         }
     }

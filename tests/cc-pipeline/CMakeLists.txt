@@ -5,6 +5,6 @@ target_link_libraries(cc-pipeline_test PRIVATE
 )
 gtest_discover_tests(cc-pipeline_test
     PROPERTIES
-        ENVIRONMENT "CCP_PLUGIN_PATH=${CMAKE_BINARY_DIR}/plugins"
-        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${CMAKE_BINARY_DIR}/bin"
+        ENVIRONMENT "CCP_PLUGIN_PATH=${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/plugins"
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${CMAKE_RUNTIME_OUTPUT_DIRECTORY}"
 )

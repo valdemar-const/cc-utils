@@ -26,10 +26,9 @@ class CC_RUNTIME_API plugin_loader
     plugin_loader &operator=(const plugin_loader &) = delete;
 
     // Default plugin search dirs (in priority order):
-    //   1. $CCP_PLUGIN_PATH (';' on Windows, ':' elsewhere)
-    //   2. <exe dir>/plugins        (installed layout)
-    //   3. <exe dir>/../plugins     (build-tree layout)
-    //   4. "."
+    //   1. $CCP_PLUGIN_PATH (';' on Windows, ':' elsewhere) — custom/install layouts
+    //   2. <exe dir>/plugins        (beside the host binary; build tree + self-contained install)
+    //   3. "."
     static auto default_search_dirs() -> std::vector<std::filesystem::path>;
 
     // Open `cc-plugin-<name>.so` from any search dir, version-check, register.

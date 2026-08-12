@@ -20,7 +20,14 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 # Runtime-loaded plugin modules live apart from build-linked shared libs:
 # conceptually they are assets discovered by the host, not libraries linked at
 # build time. cc_add_plugin routes its MODULE target here on every platform.
-set(CC_PLUGIN_OUTPUT_DIRECTORY  "${CMAKE_BINARY_DIR}/plugins" CACHE PATH "")
+# Keep them beside the executables (<runtime>/plugins): the host's plugin_loader
+# finds them via <exe dir>/plugins, and on Windows the exe's directory is the OS
+# "application directory" that resolves the plugins' shared deps (libcc-*.dll).
+# An install layout may differ — it is handled via CCP_PLUGIN_PATH / install cfg.
+# (Normal variable, not CACHE: it must always track CMAKE_RUNTIME_OUTPUT_DIRECTORY
+# and not be frozen by a stale first-configure cache entry.)
+unset(CC_PLUGIN_OUTPUT_DIRECTORY CACHE)
+set(CC_PLUGIN_OUTPUT_DIRECTORY  "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/plugins")
 
 if(CC_PIC)
   set(CMAKE_POSITION_INDEPENDENT_CODE ON)

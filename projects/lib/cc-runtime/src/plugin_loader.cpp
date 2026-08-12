@@ -90,13 +90,12 @@ namespace
                 beg = p + 1;
             }
         }
-        // Plugins are runtime "assets" discovered relative to the host
-        // executable. Two layouts are covered: installed (plugins/ is a
-        // subdirectory of exe_dir, beside the binary) and the cc-utils build
-        // tree (plugins/ is a sibling of bin/, i.e. one level up from exe_dir).
+        // Plugins are runtime "assets" discovered next to the host executable:
+        // <exe dir>/plugins. This covers both the cc-utils build tree (bin/plugins)
+        // and a self-contained install. Any other layout (FHS, custom prefix) is
+        // expected to set $CCP_PLUGIN_PATH explicitly.
         std::filesystem::path ed = exe_dir();
         dirs.push_back(ed / "plugins");
-        dirs.push_back(ed / ".." / "plugins");
         dirs.emplace_back(".");
         return dirs;
     }

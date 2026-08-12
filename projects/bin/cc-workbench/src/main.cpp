@@ -178,6 +178,30 @@ header_color_for_category(std::string_view category) -> ImVec4
 }
 
 // ---------------------------------------------------------------------------
+// Per-tab View state. Each View tab is an independent "television" that can
+// tune to any basic.view node on the graph. Tabs are dynamic DockableWindows
+// created/destroyed at runtime via HelloImGui::AddDockableWindow.
+// ---------------------------------------------------------------------------
+struct ViewTab
+{
+    int          seq = 0;               // monotonic id for unique window label
+    std::string  window_label;          // "View###v<seq>" — stable ImGui ID
+    std::string  source;                // instance_id of the selected view node
+
+    // Per-tab cache + background pull (formerly global AppState fields).
+    std::string                                                      cached_for;
+    std::optional<cc::any_value>                                     cached_value;
+    std::string                                                      cached_error;
+    std::string                                                      cached_type_name;
+    bool                                                             cache_stale     = true;
+    std::chrono::steady_clock::time_point                            stale_since     = {};
+    std::future<std::pair<std::string, std::optional<cc::any_value>>> pull_future;
+    std::string                                                      pull_target;
+    bool                                                             pull_running     = false;
+    unsigned                                                         pull_started_gen = 0;
+};
+
+// ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
 struct AppState
@@ -197,9 +221,6 @@ struct AppState
         std::string instance;
         std::string key;
     } file_dialog_target;
-
-    // View tab selection (instance_id of the view node being shown).
-    std::string view_selected;
 
     // Pending SetNodePosition requests — collected when a node is created
     // outside ed::Begin/End (e.g. from the context menu), applied next frame
@@ -252,26 +273,11 @@ struct AppState
     };
     pending_action unsaved_pending = pending_action::none;
 
-    // View tab cache. Pulling is expensive (Exec spawns a child, Assemble runs
-    // nasm+ld, ...) and doing it synchronously in the UI thread would freeze
-    // the host. Instead, pull runs in a background std::async; the UI polls
-    // its status every frame and renders whatever the cache last held.
-    std::string                           view_cached_for;
-    std::optional<cc::any_value>          view_cached_value;
-    std::string                           view_cached_error;
-    std::string                           view_cached_type_name;
-    bool                                  view_cache_stale = true; // invalidation flag
-    std::chrono::steady_clock::time_point view_stale_since = {};   // for debounce
-    // Monotonic counter bumped on every invalidation. A pull captures the value
-    // at start; on completion it only clears `view_cache_stale` if the counter
-    // is unchanged — otherwise an edit landed during the (slow, ~1s exec) pull
-    // and must trigger a fresh pull rather than being clobbered.
-    unsigned                              view_invalidate_gen = 0;
-    // Background pull state.
-    std::future<std::pair<std::string, std::optional<cc::any_value>>> view_pull_future;
-    std::string                                                       view_pull_target; // node being pulled
-    bool                                                              view_pull_running = false;
-    unsigned                                                          view_pull_started_gen = 0;
+    // View tabs — dynamic DockableWindows, each with its own cache + pull.
+    std::vector<ViewTab> view_tabs;
+    std::string          last_view_source;      // last-used source (for new tabs)
+    int                  next_view_seq     = 1;
+    unsigned             view_invalidate_gen = 0;
 
     // Fonts
     ImFont *ui_font   = nullptr;
@@ -467,10 +473,13 @@ noop_view_context  g_view_ctx;
 inline void
 invalidate_view_cache()
 {
-    g_state.view_cache_stale = true;
-    g_state.view_stale_since = std::chrono::steady_clock::now();
+    for (auto &t : g_state.view_tabs)
+    {
+        t.cache_stale = true;
+        t.stale_since = std::chrono::steady_clock::now();
+    }
     ++g_state.view_invalidate_gen;
-    g_state.pipeline_dirty   = true;
+    g_state.pipeline_dirty = true;
 }
 
 void
@@ -1340,7 +1349,8 @@ clear_graph()
     g_state.inst2ed.clear();
     g_state.ed2inst.clear();
     g_state.node_positions.clear();
-    g_state.view_selected.clear();
+    for (auto &t : g_state.view_tabs)
+        t.source.clear();
     invalidate_view_cache();
     log("graph cleared");
 }
@@ -1430,7 +1440,8 @@ do_open_pipeline(const std::string &path) -> bool
 
     g_state.pipeline_path  = path;
     g_state.pipeline_dirty = false;
-    g_state.view_selected.clear();
+    for (auto &t : g_state.view_tabs)
+        t.source.clear();
 
     // Auto Zoom-to-Fit so the user sees the restored graph immediately rather
     // than staring at the previously-empty viewport.
@@ -1710,7 +1721,8 @@ draw_pipeline_canvas()
     // These commands mutate the graph or the editor view — they belong to the
     // Pipeline tab, not the global menu. Navigate-style buttons set a flag
     // consumed inside ed::Begin/End below, where an editor context is current.
-    const bool busy = g_state.view_pull_running; // freeze UI mutations during pull
+    const bool busy = std::any_of(g_state.view_tabs.begin(), g_state.view_tabs.end(),
+                                  [](const ViewTab &t) { return t.pull_running; });
     if (busy)
     {
         ImGui::BeginDisabled();
@@ -1736,7 +1748,10 @@ draw_pipeline_canvas()
     ImGui::SameLine();
     if (busy)
     {
-        ImGui::TextDisabled("|  COMPUTING: %s ...", g_state.view_pull_target.c_str());
+        std::string pull_label;
+        for (const auto &t : g_state.view_tabs)
+            if (t.pull_running) { pull_label = t.pull_target; break; }
+        ImGui::TextDisabled("|  COMPUTING: %s ...", pull_label.c_str());
     }
     else
     {
@@ -1965,10 +1980,9 @@ draw_pipeline_canvas()
                     std::string instance = it->second;
                     g_state.g.remove_edges_of(instance);
                     g_state.g.remove_node(instance);
-                    if (g_state.view_selected == instance)
-                    {
-                        g_state.view_selected.clear();
-                    }
+                    for (auto &t : g_state.view_tabs)
+                        if (t.source == instance)
+                            t.source.clear();
                     g_state.inst2ed.erase(instance);
                     g_state.node_positions.erase(instance);
                     g_state.ed2inst.erase(it);
@@ -2053,10 +2067,66 @@ draw_pipeline_canvas()
 }
 
 // ---------------------------------------------------------------------------
-// View tab
+// View tabs — per-tab rendering + lifecycle
 // ---------------------------------------------------------------------------
+void draw_view_window(ViewTab &tab);
+
 void
-draw_view_window()
+open_view_tab(const std::string &source)
+{
+    int   seq = g_state.next_view_seq++;
+    auto &tab = g_state.view_tabs.emplace_back();
+    tab.seq          = seq;
+    tab.window_label = "View###v" + std::to_string(seq);
+    tab.source       = source;
+    tab.cache_stale  = true;
+    tab.stale_since  = std::chrono::steady_clock::now();
+
+    HelloImGui::DockableWindow w;
+    w.label         = tab.window_label;
+    w.dockSpaceName = "BottomSpace";
+    w.canBeClosed   = true;
+    int cap_seq     = seq;
+    w.GuiFunction   = [cap_seq]()
+    {
+        for (auto &t : g_state.view_tabs)
+            if (t.seq == cap_seq)
+            {
+                draw_view_window(t);
+                return;
+            }
+    };
+    HelloImGui::AddDockableWindow(w);
+}
+
+// Detect View tabs closed via the X button — remove the DockableWindow through
+// the proper HelloImGui API and erase the ViewTab entry. Only erase when the
+// DockableWindow is actually present and invisible; newly-opened tabs whose
+// window is still in the AddDockableWindow queue are skipped.
+void
+poll_view_tabs()
+{
+    auto &docks = HelloImGui::GetRunnerParams()->dockingParams.dockableWindows;
+    for (auto it = g_state.view_tabs.begin(); it != g_state.view_tabs.end();)
+    {
+        auto dw_it = std::find_if(
+            docks.begin(), docks.end(),
+            [&](const HelloImGui::DockableWindow &dw) { return dw.label == it->window_label; });
+
+        if (dw_it != docks.end() && !dw_it->isVisible)
+        {
+            HelloImGui::RemoveDockableWindow(it->window_label);
+            it = g_state.view_tabs.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+}
+
+void
+draw_view_window(ViewTab &tab)
 {
     struct view_entry
     {
@@ -2102,18 +2172,17 @@ draw_view_window()
         return;
     }
 
-    auto found = std::find_if(views.begin(), views.end(), [](const view_entry &v)
-                              {
-                                  return v.instance == g_state.view_selected;
-                              });
+    // Validate / auto-switch source if the node was deleted or pipeline changed.
+    auto found = std::find_if(
+        views.begin(), views.end(),
+        [&](const view_entry &v) { return v.instance == tab.source; });
     if (found == views.end())
     {
-        g_state.view_selected = views.front().instance;
+        tab.source               = views.front().instance;
+        g_state.last_view_source = tab.source;
+        tab.cache_stale          = true;
+        found                    = views.begin();
     }
-    found           = std::find_if(views.begin(), views.end(), [](const view_entry &v)
-                         {
-                             return v.instance == g_state.view_selected;
-                         });
     int current_idx = static_cast<int>(std::distance(views.begin(), found));
 
     auto getter = [](void *data, int idx) -> const char *
@@ -2124,21 +2193,16 @@ draw_view_window()
     ImGui::SetNextItemWidth(320);
     if (ImGui::Combo("##view_select", &current_idx, getter, &views, static_cast<int>(views.size())))
     {
-        g_state.view_selected = views[current_idx].instance;
-        // Pure UI selection — invalidate cache so the new target gets pulled next
-        // frame, but don't bump pipeline_dirty: nothing on disk has changed.
-        g_state.view_cache_stale   = true;
-        g_state.view_stale_since   = std::chrono::steady_clock::now();
-        ++g_state.view_invalidate_gen;
+        tab.source               = views[current_idx].instance;
+        g_state.last_view_source = tab.source;
+        // Per-tab UI change — invalidate only this tab, not pipeline_dirty.
+        tab.cache_stale = true;
+        tab.stale_since = std::chrono::steady_clock::now();
     }
 
     ImGui::SameLine();
     if (ImGui::SmallButton("Refresh"))
     {
-        // basic.text.from_file reads its file fresh on every pull, but the view
-        // cache only invalidates on graph edits — so editing the .tl source on
-        // disk would otherwise keep showing the stale ret_code. This forces a
-        // re-pull of the selected view.
         invalidate_view_cache();
     }
 
@@ -2146,18 +2210,15 @@ draw_view_window()
     // debounce window.
     auto trigger_pull = [&]()
     {
-        g_state.view_pull_target  = g_state.view_selected;
-        g_state.view_pull_running = true;
-        g_state.view_pull_started_gen = g_state.view_invalidate_gen; // detect edits during pull
-        g_state.view_cached_error.clear();
-        std::string target       = g_state.view_selected;
-        g_state.view_pull_future = std::async(
+        tab.pull_target      = tab.source;
+        tab.pull_running     = true;
+        tab.pull_started_gen = g_state.view_invalidate_gen;
+        tab.cached_error.clear();
+        std::string target = tab.source;
+        tab.pull_future     = std::async(
                 std::launch::async,
                 [target]() -> std::pair<std::string, std::optional<cc::any_value>>
                 {
-                    // View-tab pull shares the same pipeline_dir resolution as
-                    // run_pipeline: the user's relative paths should open from the
-                    // pipeline's directory, not from cwd.
                     std::string pipeline_dir;
                     if (!g_state.pipeline_path.empty())
                     {
@@ -2180,60 +2241,51 @@ draw_view_window()
                     {
                         return {std::string {"(no value — input is empty)"}, std::nullopt};
                     }
-                    // any_value is copyable (aa::copy) — copy into the optional.
                     return {std::string {}, std::optional<cc::any_value> {*v}};
                 }
         );
     };
 
-    // If a background pull is running, poll its status. Otherwise, if a view
-    // is selected and the cache has been stale past the debounce window, fire
-    // the next reactive pull.
-    if (g_state.view_pull_running)
+    if (tab.pull_running)
     {
         using namespace std::chrono_literals;
-        if (g_state.view_pull_future.wait_for(0s) == std::future_status::ready)
+        if (tab.pull_future.wait_for(0s) == std::future_status::ready)
         {
-            auto [error_or_type, value_opt] = g_state.view_pull_future.get();
-            g_state.view_pull_running       = false;
-            g_state.view_cached_for         = g_state.view_pull_target;
-            // Only mark fresh if no edit invalidated the cache while this (slow)
-            // pull was running. If one did, leave stale so the next frame re-pulls
-            // with the new graph — otherwise the edit's result is lost.
-            if (g_state.view_pull_started_gen == g_state.view_invalidate_gen)
+            auto [error_or_type, value_opt] = tab.pull_future.get();
+            tab.pull_running = false;
+            tab.cached_for   = tab.pull_target;
+            // Only mark fresh if no graph edit invalidated during this pull AND
+            // the source hasn't changed (user switched channel mid-pull).
+            if (tab.pull_started_gen == g_state.view_invalidate_gen && tab.pull_target == tab.source)
             {
-                g_state.view_cache_stale = false;
+                tab.cache_stale = false;
             }
             if (!error_or_type.empty())
             {
-                g_state.view_cached_error = std::move(error_or_type);
-                g_state.view_cached_value.reset();
+                tab.cached_error = std::move(error_or_type);
+                tab.cached_value.reset();
             }
             else
             {
-                g_state.view_cached_error.clear();
-                g_state.view_cached_value = std::move(value_opt);
+                tab.cached_error.clear();
+                tab.cached_value = std::move(value_opt);
             }
         }
     }
-    else if (!g_state.view_selected.empty())
+    else if (!tab.source.empty())
     {
-        // Reactive: if the cache is stale and no pull is running, wait out the
-        // debounce window (so rapid edits don't storm pulls) then trigger
-        // automatically. A fresh cache (stale == false) must NOT re-trigger —
-        // otherwise pulls fire every frame, re-spawning exec/assemble each time.
         constexpr auto kDebounce = std::chrono::milliseconds(150);
         const bool     should_pull =
-                g_state.view_cache_stale && (std::chrono::steady_clock::now() - g_state.view_stale_since >= kDebounce);
+                tab.cache_stale && (std::chrono::steady_clock::now() - tab.stale_since >= kDebounce);
         if (should_pull)
         {
             trigger_pull();
         }
     }
 
-    if (g_state.view_pull_running)
+    if (tab.pull_running)
     {
-        ImGui::TextDisabled("(pulling %s ...)", g_state.view_pull_target.c_str());
+        ImGui::TextDisabled("(pulling %s ...)", tab.pull_target.c_str());
     }
     else
     {
@@ -2242,28 +2294,28 @@ draw_view_window()
 
     ImGui::Separator();
 
-    if (!g_state.view_cached_error.empty())
+    if (!tab.cached_error.empty())
     {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.50f, 0.40f, 1.0f));
-        ImGui::TextWrapped("error: %s", g_state.view_cached_error.c_str());
+        ImGui::TextWrapped("error: %s", tab.cached_error.c_str());
         ImGui::PopStyleColor();
         return;
     }
-    if (!g_state.view_cached_value.has_value())
+    if (!tab.cached_value.has_value())
     {
         ImGui::TextDisabled("(no value yet — waiting for upstream)");
         return;
     }
 
-    auto  type_desc = g_state.view_cached_value->type_descriptor();
+    auto  type_desc = tab.cached_value->type_descriptor();
     auto *renderer  = g_state.host->renderers().get_for_type(type_desc);
     if (!renderer)
     {
-        ImGui::TextDisabled("(no renderer registered for type '%s')", g_state.view_cached_type_name.c_str());
+        ImGui::TextDisabled("(no renderer registered for type '%s')", tab.cached_type_name.c_str());
         return;
     }
     static noop_view_context ctx;
-    renderer->render(*g_state.view_cached_value, ctx);
+    renderer->render(*tab.cached_value, ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -2305,29 +2357,13 @@ draw_main_menu(HelloImGui::DockingParams &docking)
     }
 
     // ---- View ----
-    // Three logical groups:
-    //   1. Open tab — show windows that aren't permanently visible.
-    //   2. Window visibility for includeInViewMenu=true windows (Logger, etc.).
-    //   3. Layout management — Reset restores the initial docking splits; the
-    //      Switch layout submenu is a placeholder for future named profiles,
-    //      currently only "default" (= reset).
     if (ImGui::BeginMenu("View"))
     {
         if (ImGui::BeginMenu("Open tab"))
         {
-            // Iterate windows that are closeable but exclude always-visible ones.
-            // The Pipeline / View / Logger windows all carry canBeClosed=false in
-            // main(); make them openable on demand by name so a closed-by-user
-            // window (e.g. View, once we lift the canBeClosed flag) can come back.
-            for (auto &w : docking.dockableWindows)
+            if (ImGui::MenuItem("View"))
             {
-                if (w.label == "Pipeline" || w.label == "View" || w.label == "Logger")
-                {
-                    if (ImGui::MenuItem(w.label.c_str()))
-                    {
-                        w.isVisible = true;
-                    }
-                }
+                open_view_tab(g_state.last_view_source);
             }
             ImGui::EndMenu();
         }
@@ -2335,8 +2371,7 @@ draw_main_menu(HelloImGui::DockingParams &docking)
         ImGui::Separator();
 
         // Generic visibility toggles for any window that opts into the View menu
-        // via includeInViewMenu=true (kept for forward compat; currently unused
-        // since Pipeline/View/Logger all have it set false in main()).
+        // via includeInViewMenu=true.
         for (auto &w : docking.dockableWindows)
         {
             if (w.includeInViewMenu)
@@ -2657,6 +2692,13 @@ main()
     params.callbacks.ShowGui = []()
     {
         process_global_hotkeys();
+
+        // Ensure at least one View tab exists.
+        if (g_state.view_tabs.empty())
+            open_view_tab(g_state.last_view_source);
+
+        poll_view_tabs();
+
         draw_about_popup();
         draw_load_error_modal();
         draw_load_warnings_modal();
@@ -2750,20 +2792,6 @@ main()
         {
             poll_file_dialog();
             draw_pipeline_canvas();
-        };
-        params.dockingParams.dockableWindows.push_back(w);
-    }
-
-    // --- View window ---
-    {
-        HelloImGui::DockableWindow w;
-        w.label             = "View";
-        w.dockSpaceName     = "BottomSpace";
-        w.canBeClosed       = false;
-        w.includeInViewMenu = false;
-        w.GuiFunction       = []()
-        {
-            draw_view_window();
         };
         params.dockingParams.dockableWindows.push_back(w);
     }

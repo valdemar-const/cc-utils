@@ -2629,6 +2629,7 @@ main()
         ImGuiIO                      &io = ImGui::GetIO();
         HelloImGui::FontLoadingParams ui;
         ui.fontConfig.GlyphRanges = io.Fonts->GetGlyphRangesCyrillic();
+        ui.fontConfig.RasterizerDensity = 2.0f;
         g_state.ui_font           = HelloImGui::LoadFont("fonts/UI-Regular.ttf", 20.0f, ui);
 
         if (HelloImGui::AssetExists("fonts/NotoColorEmoji.ttf"))
@@ -2647,6 +2648,7 @@ main()
         {
             HelloImGui::FontLoadingParams mono;
             mono.fontConfig.GlyphRanges = io.Fonts->GetGlyphRangesCyrillic();
+            mono.fontConfig.RasterizerDensity = 2.0f;
             g_state.mono_font           = HelloImGui::LoadFont("fonts/IBMPlexMono-Regular.ttf", 16.0f, mono);
         }
     };

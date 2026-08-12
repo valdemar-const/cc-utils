@@ -286,20 +286,13 @@ class noop_view_context final : public cc::view_context
 // declared after log_view for order-of-init reasons.
 extern AppState g_state;
 
-// Read-only TextEditor backing the Logger window. Plain-text palette (no
-// language definition); gives free selection + Ctrl+C.
-// On update: preserves scroll unless the user was at the bottom (sticky).
+// Read-only scrolling log view with click-drag selection + Ctrl+C.
+// Uses ImGui::BeginChild + ImGuiListClipper so scroll (X/Y) is preserved
+// across frames — no SetText that resets scroll state.
 class log_view final
 {
   public:
 
-    log_view()
-    {
-        editor_.SetPalette(TextEditor::GetDarkPalette());
-        editor_.SetReadOnlyEnabled(true);
-    }
-
-    // Thread-safe append — activate() runs on a worker thread (async pull).
     void
     append(std::string_view line)
     {
@@ -309,50 +302,151 @@ class log_view final
         dirty_ = true;
     }
 
-    // Render is called only from the UI thread.
     void
     render()
     {
+        // ---- Toolbar ----
         {
-            std::lock_guard lock(mutex_);
-            if (dirty_)
+            ImGui::AlignTextToFramePadding();
+            ImGui::Checkbox("Follow", &follow_);
+            ImGui::SameLine();
+            if (ImGui::Button("Copy All"))
             {
-                // SetText resets scroll. If user was near the bottom, stick to bottom
-                // (usual terminal behaviour); otherwise restore the first visible line.
-                size_t first  = editor_.GetFirstVisibleRow();
-                size_t total  = editor_.GetLineCount();
-                bool   at_end = (first + 3 >= total) || (total < 5);
+                std::lock_guard lock(mutex_);
+                ImGui::SetClipboardText(buffer_.c_str());
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Clear"))
+            {
+                std::lock_guard lock(mutex_);
+                buffer_.clear();
+                lines_.clear();
+                dirty_    = false;
+                sel_lo_   = sel_hi_ = -1;
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%zu lines)", lines_.size());
+        }
 
-                editor_.SetText(buffer_);
-                size_t new_total = editor_.GetLineCount();
-                if (at_end && new_total > 0)
-                {
-                    editor_.ScrollToLine(new_total, TextEditor::Scroll::alignBottom);
-                }
-                else if (first < new_total)
-                {
-                    editor_.ScrollToLine(first, TextEditor::Scroll::alignTop);
-                }
-                dirty_ = false;
+        std::lock_guard lock(mutex_);
+
+        if (dirty_)
+            rebuild_lines();
+
+        if (g_state.mono_font)
+            ImGui::PushFont(g_state.mono_font);
+
+        ImGui::BeginChild("##log_text", ImVec2(0, 0), false,
+                          ImGuiWindowFlags_HorizontalScrollbar);
+
+        const float lh      = ImGui::GetTextLineHeightWithSpacing();
+        const float top_y   = ImGui::GetCursorScreenPos().y;
+        const bool  hovered = ImGui::IsWindowHovered();
+
+        // ---- Mouse-based line selection ----
+        if (hovered && !lines_.empty())
+        {
+            float my   = ImGui::GetMousePos().y;
+            int   line = static_cast<int>((my - top_y) / lh);
+            line       = std::clamp(line, 0, static_cast<int>(lines_.size()) - 1);
+
+            if (ImGui::IsMouseClicked(0))
+            {
+                sel_lo_ = sel_hi_ = line;
+            }
+            else if (ImGui::IsMouseDown(0) && sel_lo_ >= 0)
+            {
+                sel_hi_ = line;
             }
         }
-        if (g_state.mono_font)
+
+        // Ctrl+C copies selected lines
+        if (hovered && sel_lo_ >= 0
+            && ImGui::GetIO().KeyCtrl
+            && ImGui::IsKeyPressed(ImGuiKey_C))
         {
-            ImGui::PushFont(g_state.mono_font);
+            int lo = std::min(sel_lo_, sel_hi_);
+            int hi = std::max(sel_lo_, sel_hi_);
+            std::string text;
+            for (int i = lo; i <= hi && i < static_cast<int>(lines_.size()); ++i)
+            {
+                text.append(lines_[i].data(), lines_[i].size());
+                text.append("\n");
+            }
+            ImGui::SetClipboardText(text.c_str());
         }
-        editor_.Render("##log_text", ImVec2(0, 0), false);
-        if (g_state.mono_font)
+
+        // ---- Render lines ----
+        if (!lines_.empty())
         {
+            int lo = (sel_lo_ >= 0) ? std::min(sel_lo_, sel_hi_) : -1;
+            int hi = (sel_lo_ >= 0) ? std::max(sel_lo_, sel_hi_) : -1;
+
+            auto *dl = ImGui::GetWindowDrawList();
+            ImVec2 clip_min = dl->GetClipRectMin();
+
+            ImGuiListClipper clipper;
+            clipper.Begin(static_cast<int>(lines_.size()), lh);
+            while (clipper.Step())
+            {
+                for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i)
+                {
+                    if (lo >= 0 && i >= lo && i <= hi)
+                    {
+                        ImVec2 p = ImGui::GetCursorScreenPos();
+                        dl->AddRectFilled(
+                            ImVec2(clip_min.x, p.y),
+                            ImVec2(p.x + 1e4f, p.y + lh),
+                            IM_COL32(55, 95, 145, 130));
+                    }
+                    const auto &sv = lines_[i];
+                    ImGui::TextUnformatted(sv.data(), sv.data() + sv.size());
+                }
+            }
+            clipper.End();
+        }
+
+        // Sticky-to-bottom
+        if (dirty_ && follow_ && was_at_bottom_)
+            ImGui::SetScrollHereY(1.0f);
+
+        was_at_bottom_ = ImGui::GetScrollY() >= ImGui::GetScrollMaxY()
+                                 - 2.0f * ImGui::GetTextLineHeight();
+
+        dirty_ = false;
+        ImGui::EndChild();
+
+        if (g_state.mono_font)
             ImGui::PopFont();
-        }
     }
 
   private:
 
-    TextEditor  editor_;
-    std::string buffer_;
-    bool        dirty_ = false;
-    std::mutex  mutex_;
+    void
+    rebuild_lines()
+    {
+        lines_.clear();
+        size_t start = 0;
+        for (size_t i = 0; i < buffer_.size(); ++i)
+        {
+            if (buffer_[i] == '\n')
+            {
+                lines_.emplace_back(buffer_.data() + start, i - start);
+                start = i + 1;
+            }
+        }
+        if (start < buffer_.size())
+            lines_.emplace_back(buffer_.data() + start, buffer_.size() - start);
+    }
+
+    std::string              buffer_;
+    std::vector<std::string_view> lines_;
+    bool                     dirty_        = false;
+    bool                     follow_       = true;
+    bool                     was_at_bottom_ = true;
+    int                      sel_lo_       = -1;
+    int                      sel_hi_       = -1;
+    std::mutex               mutex_;
 };
 
 AppState           g_state;

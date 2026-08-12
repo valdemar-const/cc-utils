@@ -177,6 +177,8 @@ header_color_for_category(std::string_view category) -> ImVec4
     return hash_color(category);
 }
 
+constexpr std::string_view kViewTabIcon = "\xf0\x9f\x91\x81"; // 👁 U+1F441 EYE
+
 // ---------------------------------------------------------------------------
 // Per-tab View state. Each View tab is an independent "television" that can
 // tune to any basic.view node on the graph. Tabs are dynamic DockableWindows
@@ -2185,6 +2187,23 @@ draw_view_window(ViewTab &tab)
     }
     int current_idx = static_cast<int>(std::distance(views.begin(), found));
 
+    // Sync window title with current source name (e.g. "View: mynode###v3").
+    {
+        std::string suffix = "###v" + std::to_string(tab.seq);
+        std::string title  = std::string {kViewTabIcon} + " " + views[current_idx].label + suffix;
+        if (title != tab.window_label)
+        {
+            tab.window_label = title;
+            auto &docks      = HelloImGui::GetRunnerParams()->dockingParams.dockableWindows;
+            for (auto &dw : docks)
+                if (dw.label.find(suffix) != std::string::npos)
+                {
+                    dw.label = title;
+                    break;
+                }
+        }
+    }
+
     auto getter = [](void *data, int idx) -> const char *
     {
         const auto *v = static_cast<const std::vector<view_entry> *>(data);
@@ -2760,15 +2779,24 @@ main()
         ui.fontConfig.RasterizerDensity = 2.0f;
         g_state.ui_font           = HelloImGui::LoadFont("fonts/UI-Regular.ttf", 20.0f, ui);
 
-        if (HelloImGui::AssetExists("fonts/NotoColorEmoji.ttf"))
+        // Merge monochrome NotoEmoji (vector outlines, not bitmap) into the UI
+        // font so emoji glyphs render everywhere — including dock tab titles.
+        if (HelloImGui::AssetExists("fonts/NotoEmoji-Regular.ttf"))
         {
 #if defined(IMGUI_USE_WCHAR32)
-            static const ImWchar          emoji_ranges[] = {0x1F600, 0x1F64F, 0x2764, 0x2764, 0, 0};
+            static const ImWchar emoji_ranges[] = {
+                0x1F4FA, 0x1F4FA, // 📺 television
+                0x1F50D, 0x1F50D, // 🔍 magnifying glass
+                0x1F441, 0x1F441, // 👁 eye
+                0x1F600, 0x1F64F, // emoticons
+                0x2764,  0x2764,  // ❤ heart
+                0,
+            };
             HelloImGui::FontLoadingParams em;
             em.mergeToLastFont        = true;
-            em.loadColor              = true;
             em.fontConfig.GlyphRanges = emoji_ranges;
-            HelloImGui::LoadFont("fonts/NotoColorEmoji.ttf", 20.0f, em);
+            em.fontConfig.RasterizerDensity = 2.0f;
+            HelloImGui::LoadFont("fonts/NotoEmoji-Regular.ttf", 20.0f, em);
 #endif
         }
 
@@ -2779,6 +2807,8 @@ main()
             mono.fontConfig.RasterizerDensity = 2.0f;
             g_state.mono_font           = HelloImGui::LoadFont("fonts/IBMPlexMono-Regular.ttf", 16.0f, mono);
         }
+
+        io.FontDefault = g_state.ui_font;
     };
 
     // --- Pipeline window ---

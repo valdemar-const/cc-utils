@@ -152,26 +152,12 @@ pin_color_for_type(std::string_view type_name) -> ImVec4
 auto
 icon_for_type(std::string_view type_name) -> IconType
 {
-    if (type_name == "text")
-    {
-        return IconType::Circle;
-    }
-    if (type_name == "path")
-    {
+    if (type_name == "path" || type_name == "bytes")
         return IconType::Diamond;
-    }
-    if (type_name == "int")
-    {
-        return IconType::Circle;
-    }
-    if (type_name == "bytes")
-    {
-        return IconType::Diamond;
-    }
     if (type_name == "any" || type_name.empty())
-    {
         return IconType::Grid;
-    }
+    if (type_name == "text" || type_name == "int")
+        return IconType::Circle;
     return IconType::Square; // structured (ast/ir/...)
 }
 
@@ -1154,27 +1140,37 @@ draw_node(cc::node &n)
             factory ? std::string {factory->display_name()} : tid;
     const std::string category =
             factory ? std::string {factory->category()} : std::string {};
-    const ImVec4 header_color = header_color_for_category(category);
+    const ImVec4 cat_color = header_color_for_category(category);
 
     util::BlueprintNodeBuilder b;
     b.Begin(ed_id);
 
-    // ---- Header: coloured band with display name ----
-    b.Header(header_color);
+    // ---- Header: subtle tinted band with title ----
+    // Blender-style: faint category-tinted background, colored dot, title text.
+    b.Header(ImVec4(
+        cat_color.x * 0.12f + 0.14f,
+        cat_color.y * 0.12f + 0.14f,
+        cat_color.z * 0.12f + 0.18f,
+        1.0f));
+
+    // Category color dot before the title.
+    {
+        float cy = ImGui::GetCursorScreenPos().y + ImGui::GetTextLineHeight() * 0.5f;
+        float cx = ImGui::GetCursorScreenPos().x + 4.0f;
+        ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(cx, cy), 4.0f, ImColor(cat_color), 10);
+        ImGui::Dummy(ImVec2(12, ImGui::GetTextLineHeight()));
+    }
     ImGui::TextUnformatted(display_name.c_str());
     ImGui::Spring(1);
     ImGui::TextDisabled("%s", tid.c_str());
     b.EndHeader();
 
-    // ---- Input pins (left side) ----
-    // Collect outputs to render after Middle; BlueprintNodeBuilder requires
-    // the order Header → Inputs → Middle → Outputs → End.
+    // ---- Two-column pin layout (no Middle) ----
     struct out_pin_t
     {
         int             id;
         const cc::slot *slot;
     };
-
     std::vector<out_pin_t> outputs;
 
     int slot_idx = 0;
@@ -1186,16 +1182,14 @@ draw_node(cc::node &n)
             outputs.push_back({pin_id, slot});
             continue;
         }
-        auto type_name = g_state.host->types().name_of(slot->type());
+        auto   type_name = g_state.host->types().name_of(slot->type());
         if (type_name.empty())
-        {
-            type_name = "any"; // wildcard slots
-        }
+            type_name = "any";
         ImVec4   pin_color = pin_color_for_type(type_name);
         IconType pin_icon  = icon_for_type(type_name);
 
         b.Input(pin_id);
-        Icon(ImVec2(20, 20), pin_icon, true, pin_color, ImVec4(0, 0, 0, 0));
+        Icon(ImVec2(16, 16), pin_icon, true, pin_color, ImVec4(0, 0, 0, 0));
         ImGui::Spring(0);
         ImGui::TextUnformatted(slot->id().data());
         ImGui::Spring(0);
@@ -1203,24 +1197,11 @@ draw_node(cc::node &n)
         b.EndInput();
     }
 
-    // ---- Middle: property editor (under input pins) ----
-    b.Middle();
-    if (factory)
-    {
-        for (const auto &desc : factory->property_schema())
-        {
-            draw_property_widget(n, desc);
-        }
-    }
-
-    // ---- Output pins (right side) ----
     for (const auto &op : outputs)
     {
-        auto type_name = g_state.host->types().name_of(op.slot->type());
+        auto   type_name = g_state.host->types().name_of(op.slot->type());
         if (type_name.empty())
-        {
             type_name = "any";
-        }
         ImVec4   pin_color = pin_color_for_type(type_name);
         IconType pin_icon  = icon_for_type(type_name);
 
@@ -1229,8 +1210,18 @@ draw_node(cc::node &n)
         ImGui::Spring(0);
         ImGui::TextUnformatted(op.slot->id().data());
         ImGui::Spring(0);
-        Icon(ImVec2(20, 20), pin_icon, true, pin_color, ImVec4(0, 0, 0, 0));
+        Icon(ImVec2(16, 16), pin_icon, true, pin_color, ImVec4(0, 0, 0, 0));
         b.EndOutput();
+    }
+
+    // ---- Footer: property editor (full width, below pins) ----
+    if (factory && !factory->property_schema().empty())
+    {
+        b.Footer();
+        for (const auto &desc : factory->property_schema())
+        {
+            draw_property_widget(n, desc);
+        }
     }
 
     b.End();
@@ -2605,12 +2596,13 @@ main()
         ed::SetCurrentEditor(g_editor);
 
         auto &s                                = ed::GetStyle();
-        s.NodeRounding                         = 6.0f;
-        s.PinRounding                          = 8.0f;
-        s.Colors[ed::StyleColor_Bg]            = ImVec4(0.10f, 0.10f, 0.13f, 1.00f);
-        s.Colors[ed::StyleColor_NodeBg]        = ImVec4(0.16f, 0.16f, 0.20f, 1.00f);
-        s.Colors[ed::StyleColor_NodeBorder]    = ImVec4(0.35f, 0.35f, 0.42f, 0.90f);
-        s.Colors[ed::StyleColor_HovNodeBorder] = ImVec4(0.60f, 0.60f, 0.68f, 1.00f);
+        s.NodeRounding                         = 8.0f;
+        s.PinRounding                          = 6.0f;
+        s.NodePadding                          = ImVec4(8, 4, 8, 4);
+        s.Colors[ed::StyleColor_Bg]            = ImVec4(0.09f, 0.09f, 0.11f, 1.00f);
+        s.Colors[ed::StyleColor_NodeBg]        = ImVec4(0.15f, 0.15f, 0.18f, 1.00f);
+        s.Colors[ed::StyleColor_NodeBorder]    = ImVec4(0.30f, 0.30f, 0.36f, 0.80f);
+        s.Colors[ed::StyleColor_HovNodeBorder] = ImVec4(0.55f, 0.55f, 0.62f, 1.00f);
         s.Colors[ed::StyleColor_SelNodeBorder] = ImVec4(0.95f, 0.75f, 0.30f, 1.00f);
 
         ImFileDialogSetupTextureLoader();

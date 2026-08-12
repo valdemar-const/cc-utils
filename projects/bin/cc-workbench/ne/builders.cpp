@@ -153,6 +153,17 @@ util::BlueprintNodeBuilder::Middle()
 }
 
 void
+util::BlueprintNodeBuilder::Footer()
+{
+    if (CurrentStage == Stage::Begin)
+    {
+        SetStage(Stage::Content);
+    }
+
+    SetStage(Stage::Footer);
+}
+
+void
 util::BlueprintNodeBuilder::Output(ed::PinId id)
 {
     if (CurrentStage == Stage::Begin)
@@ -233,6 +244,10 @@ util::BlueprintNodeBuilder::SetStage(Stage stage)
 
         break;
 
+    case Stage::Footer:
+        ImGui::EndVertical();
+        break;
+
     case Stage::Output:
         ed::PopStyleVar(2);
 
@@ -291,6 +306,25 @@ util::BlueprintNodeBuilder::SetStage(Stage stage)
         ImGui::BeginVertical("middle", ImVec2(0, 0), 1.0f);
         break;
 
+    case Stage::Footer:
+        // Expanding spring ensures content row stretches to full node width
+        // even when there are no output pins (otherwise the input column
+        // would float in the horizontal centre of the node).
+        // Only added when coming from Input — the Output entry already adds
+        // a leading spring that pushes outputs to the right edge.
+        if (oldStage == Stage::Input)
+        {
+            ImGui::Spring(1, 0);
+        }
+        // Close the content horizontal row (Input|Output columns) and start
+        // a full-width vertical section below the pins.
+        ImGui::EndHorizontal();
+        ContentMin = ImGui::GetItemRectMin();
+        ContentMax = ImGui::GetItemRectMax();
+        ImGui::Spring(0, ImGui::GetStyle().ItemSpacing.y * 2.0f);
+        ImGui::BeginVertical("footer", ImVec2(0, 0), 0.0f);
+        break;
+
     case Stage::Output:
         if (oldStage == Stage::Middle || oldStage == Stage::Input)
         {
@@ -316,12 +350,12 @@ util::BlueprintNodeBuilder::SetStage(Stage stage)
         {
             ImGui::Spring(1, 0);
         }
-        if (oldStage != Stage::Begin)
+        if (oldStage != Stage::Begin && oldStage != Stage::Footer)
         {
             ImGui::EndHorizontal();
+            ContentMin = ImGui::GetItemRectMin();
+            ContentMax = ImGui::GetItemRectMax();
         }
-        ContentMin = ImGui::GetItemRectMin();
-        ContentMax = ImGui::GetItemRectMax();
 
         // ImGui::Spring(0);
         ImGui::EndVertical();

@@ -550,6 +550,28 @@ editor_id_for(const std::string &instance_id) -> int
     return id;
 }
 
+// Instantiate a node with a graph-unique instance_id. Factories generate
+// fresh ids from per-process counters (#1, #2, ...), which know nothing
+// about ids restored from a loaded file via create_with_id() — a freshly
+// created node can therefore collide with a restored one (identical ids ⇒
+// identical editor pin ids ⇒ stacklayout double-Begin assert). Retrying
+// advances the counter until the id is free.
+auto
+spawn_node(cc::node_factory *f) -> std::unique_ptr<cc::node>
+{
+    std::unique_ptr<cc::node> node;
+    while (f)
+    {
+        node = f->create();
+        if (!node || !g_state.g.find_node(node->instance_id()))
+        {
+            return node;
+        }
+        log("instance id '" + std::string {node->instance_id()} + "' already in graph (restored from file) — regenerating");
+    }
+    return nullptr;
+}
+
 // ---------------------------------------------------------------------------
 // Host-side view renderers (must live in the host to call ImGui directly
 // without dragging ImGui into plugin .so)
@@ -1332,7 +1354,7 @@ draw_create_menu()
                     label += std::string {f->type_id()};
                     if (ImGui::Selectable(label.c_str()))
                     {
-                        auto        node = f->create();
+                        auto        node = spawn_node(f);
                         std::string instance {node->instance_id()};
                         int         ed_id = editor_id_for(instance);
                         g_state.g.add_node(std::move(node));
@@ -1385,7 +1407,7 @@ draw_create_menu()
                     label += std::string {f->type_id()};
                     if (ImGui::Selectable(label.c_str()))
                     {
-                        auto        node = f->create();
+                        auto        node = spawn_node(f);
                         std::string instance {node->instance_id()};
                         int         ed_id = editor_id_for(instance);
                         g_state.g.add_node(std::move(node));
@@ -1520,7 +1542,7 @@ draw_palette_drop()
                 if (ImGui::Selectable(label.c_str()))
                 {
                     // Instantiate and find the first compatible slot to wire.
-                    auto        new_node = f->create();
+                    auto        new_node = spawn_node(f);
                     std::string new_id {new_node->instance_id()};
                     int         ed_id = editor_id_for(new_id);
 

@@ -110,6 +110,36 @@ class type_registry_impl final : public type_registry
     }
 
     auto
+    register_value_editor(std::string_view type_name, std::string_view editor_name) -> void override
+    {
+        if (type_name.empty() || editor_name.empty())
+        {
+            return;
+        }
+        auto &list = value_editors_by_name_[std::string {type_name}];
+        if (std::find(list.begin(), list.end(), editor_name) == list.end())
+        {
+            list.emplace_back(editor_name);
+        }
+    }
+
+    auto
+    value_editors_of(type_descriptor_t d) const -> std::vector<std::string_view> override
+    {
+        auto name = name_of(d);
+        if (name.empty())
+        {
+            return {};
+        }
+        auto it = value_editors_by_name_.find(std::string {name});
+        if (it == value_editors_by_name_.end())
+        {
+            return {};
+        }
+        return {it->second.begin(), it->second.end()};
+    }
+
+    auto
     register_value_type_impl(value_type_desc d, type_descriptor_t t) -> bool override
     {
         // The wildcard input type. Accepted under either spelling for
@@ -153,12 +183,13 @@ class type_registry_impl final : public type_registry
         value_parse_fn parse;
     };
 
-    std::unordered_map<std::string, type_descriptor_t> name_to_desc_;
-    std::unordered_map<type_descriptor_t, std::string> desc_to_name_;
-    std::unordered_map<type_descriptor_t, std::string> desc_to_short_;
-    std::unordered_map<std::string, inline_editor>     editors_by_name_;
-    std::optional<type_descriptor_t>                   any_descriptor_;
-    std::function<void(std::string_view)>              hook_;
+    std::unordered_map<std::string, type_descriptor_t>        name_to_desc_;
+    std::unordered_map<type_descriptor_t, std::string>        desc_to_name_;
+    std::unordered_map<type_descriptor_t, std::string>        desc_to_short_;
+    std::unordered_map<std::string, inline_editor>            editors_by_name_;
+    std::unordered_map<std::string, std::vector<std::string>> value_editors_by_name_;
+    std::optional<type_descriptor_t>                          any_descriptor_;
+    std::function<void(std::string_view)>                     hook_;
 };
 
 // ===========================================================================

@@ -286,6 +286,103 @@ TEST(cc_pipeline, inline_value_injection_and_file_chain) {
   }
 }
 
+// basic/types ships its own nodes: typed constants (let-pattern — the inline
+// `in` pin IS the value editor) populate the Basic Types palette section, so
+// importing the domain yields usable sources, not just connection vocabulary.
+TEST(cc_pipeline, basic_types_constant_nodes) {
+  cc::runtime::plugin_loader loader;
+  auto host = cc::runtime::make_host_registry();
+  ASSERT_GE(loader.load_all(*host), 1u);
+  cc::runtime::register_inline_editors(*host);
+
+  // The four factories exist and are members of basic/types (palette feed).
+  for (std::string_view id : {"basic.types.string", "basic.types.integer",
+                              "basic.types.double", "basic.types.boolean"}) {
+    const auto* f = host->find_node_factory(id);
+    ASSERT_NE(f, nullptr) << id;
+    bool member = false;
+    for (auto d : f->domains()) member = member || d == "basic/types";
+    EXPECT_TRUE(member) << id;
+  }
+
+  cc::runtime::graph g;
+  std::string s = add_node(g, *host, "basic.types.string");
+  std::string i = add_node(g, *host, "basic.types.integer");
+  std::string d = add_node(g, *host, "basic.types.double");
+  std::string b = add_node(g, *host, "basic.types.boolean");
+  g.find_node(s)->slot_values().set("in", "hello");
+  g.find_node(i)->slot_values().set("in", "42");
+  g.find_node(d)->slot_values().set("in", "2.5");
+  g.find_node(b)->slot_values().set("in", "true");
+
+  cc::runtime::runner r{g, {}, {}, &host->types()};
+  auto rs = r.pull(s, "value");
+  ASSERT_TRUE(rs.has_value()) << rs.error().what;
+  const auto* vs = aa::any_cast<std::string>(*rs);
+  ASSERT_NE(vs, nullptr);
+  EXPECT_EQ(*vs, "hello");
+  auto ri = r.pull(i, "value");
+  ASSERT_TRUE(ri.has_value()) << ri.error().what;
+  const auto* vi = aa::any_cast<long>(*ri);
+  ASSERT_NE(vi, nullptr);
+  EXPECT_EQ(*vi, 42);
+  auto rd = r.pull(d, "value");
+  ASSERT_TRUE(rd.has_value()) << rd.error().what;
+  const auto* vd = aa::any_cast<double>(*rd);
+  ASSERT_NE(vd, nullptr);
+  EXPECT_DOUBLE_EQ(*vd, 2.5);
+  auto rb = r.pull(b, "value");
+  ASSERT_TRUE(rb.has_value()) << rb.error().what;
+  const auto* vb = aa::any_cast<bool>(*rb);
+  ASSERT_NE(vb, nullptr);
+  EXPECT_TRUE(*vb);
+
+  // No inline text and no wire → helpful failure naming the remedies.
+  g.find_node(s)->slot_values().set("in", "");
+  cc::runtime::runner r2{g, {}, {}, &host->types()};
+  auto bad = r2.pull(s, "value");
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_NE(bad.error().what.find("value not set"), std::string::npos)
+      << bad.error().what;
+}
+
+// Named value-editor catalog ("open with editor…"): type name → editor ids,
+// host-layer like inline editors. String offers "Text"; types without
+// editors report an empty list; registration is deduped.
+TEST(cc_pipeline, value_editor_catalog) {
+  cc::runtime::plugin_loader loader;
+  auto host = cc::runtime::make_host_registry();
+  ASSERT_GE(loader.load_all(*host), 1u);
+  cc::runtime::register_inline_editors(*host);
+  cc::runtime::register_value_editors(*host);
+
+  const auto str_d = host->types().descriptor_of_name("String");
+  ASSERT_TRUE(str_d != cc::type_descriptor_t{});
+  auto editors = host->types().value_editors_of(str_d);
+  ASSERT_EQ(editors.size(), 2u);
+  EXPECT_EQ(editors[0], "editors.text.plain");
+  EXPECT_EQ(editors[1], "editors.text.code");
+
+  // Idempotent registration does not duplicate entries.
+  cc::runtime::register_value_editors(*host);
+  EXPECT_EQ(host->types().value_editors_of(str_d).size(), 2u);
+
+  // Types without full-size editors — empty catalog.
+  const auto int_d = host->types().descriptor_of_name("Integer");
+  EXPECT_TRUE(host->types().value_editors_of(int_d).empty());
+  EXPECT_TRUE(host->types()
+                  .value_editors_of(host->types().descriptor_of_name(
+                      "NoSuchType"))
+                  .empty());
+
+  // Path (footer properties map onto it) offers the plain text editor —
+  // the SAME id as String's entry: editor ids are global identities.
+  const auto path_d = host->types().descriptor_of_name("Path");
+  auto path_editors = host->types().value_editors_of(path_d);
+  ASSERT_EQ(path_editors.size(), 1u);
+  EXPECT_EQ(path_editors[0], "editors.text.plain");
+}
+
 // The host-layer File editor: the inline text is resolved against
 // pipeline_dir and stat-validated into a real file_handle BEFORE the graph
 // runs — every :file input (e.g. exec's) gets it, uniformly.

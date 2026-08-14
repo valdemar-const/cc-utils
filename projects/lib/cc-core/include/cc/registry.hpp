@@ -68,6 +68,15 @@ class CC_CORE_API type_registry
     // registered (lookup resolves through the canonical name).
     virtual auto register_inline_editor(std::string_view type_name, property_kind control, value_parse_fn parse) -> bool = 0;
 
+    // Register a NAMED value editor ("open with editor…") for every pin of
+    // the named connection type. Same host-layer extension point as inline
+    // editors, but an open catalog: a type may offer several editors, and
+    // the workbench lists them when the user opens a pin's value in an
+    // Editor tab. The registry stores only the type name → editor ids
+    // mapping; the editor widgets themselves are workbench-side. Deduped,
+    // order-preserving, empty names ignored.
+    virtual auto register_value_editor(std::string_view type_name, std::string_view editor_name) -> void = 0;
+
     // Lookup by descriptor → canonical name, or empty string_view if unknown.
     virtual auto name_of(type_descriptor_t d) const -> std::string_view = 0;
 
@@ -89,6 +98,11 @@ class CC_CORE_API type_registry
     // inline editor, the validator rejects the text, or the type is unknown.
     virtual auto parse_value(type_descriptor_t d, std::string_view text, std::string_view pipeline_dir) const
             -> std::expected<any_value, std::string> = 0;
+
+    // Editor ids offered for values of this type, in registration order;
+    // empty for unknown or editor-less types. The returned views stay valid
+    // as long as the registry lives.
+    virtual auto value_editors_of(type_descriptor_t d) const -> std::vector<std::string_view> = 0;
 
   protected:
 

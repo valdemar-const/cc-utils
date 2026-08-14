@@ -2,6 +2,7 @@
 //
 // Seeds vocabulary domains:
 //   basic/types      — String, Integer, Double, Boolean, Any (wildcard)
+//                      + basic.types.* constant nodes (typed value sources)
 //   filesystem       — Path, File, FileAttrs + file/path nodes
 //   basic/text       — text.constant
 //   basic/view       — view (debug tap)
@@ -938,6 +939,164 @@ namespace
     };
 
     // ---------------------------------------------------------------------------
+    // basic.types.* — typed value sources (String / Integer / Double /
+    // Boolean). Same let-pattern as filesystem.path: the unconnected `in` pin
+    // is inline-editable (the runner parses and injects the text), a wired
+    // edge overrides it, and the typed `value` output is the fan-out point.
+    // Gives the basic/types palette section actual nodes, so importing the
+    // domain yields usable sources — not just connection vocabulary.
+    // ---------------------------------------------------------------------------
+    template<typename T>
+    struct constant_traits; // deliberate: only the four supported types below
+
+    template<>
+    struct constant_traits<std::string>
+    {
+        static constexpr std::string_view type_id      = "basic.types.string";
+        static constexpr std::string_view display_name = "String";
+    };
+
+    template<>
+    struct constant_traits<long>
+    {
+        static constexpr std::string_view type_id      = "basic.types.integer";
+        static constexpr std::string_view display_name = "Integer";
+    };
+
+    template<>
+    struct constant_traits<double>
+    {
+        static constexpr std::string_view type_id      = "basic.types.double";
+        static constexpr std::string_view display_name = "Double";
+    };
+
+    template<>
+    struct constant_traits<bool>
+    {
+        static constexpr std::string_view type_id      = "basic.types.boolean";
+        static constexpr std::string_view display_name = "Boolean";
+    };
+
+    template<typename T>
+    class typed_constant_node final : public node
+    {
+      public:
+
+        typed_constant_node()
+            : id_(fresh_instance_id(constant_traits<T>::type_id))
+        {
+        }
+
+        explicit typed_constant_node(std::string id)
+            : id_(std::move(id))
+        {
+        }
+
+        auto
+        type_id() const -> std::string_view override
+        {
+            return constant_traits<T>::type_id;
+        }
+
+        auto
+        instance_id() const -> std::string_view override
+        {
+            return id_;
+        }
+
+        auto
+        slots() const -> std::span<const slot * const> override
+        {
+            static const basic_slot      s_in {"in", descriptor_of<T>, slot_dir::in, slot_card::single, false};
+            static const basic_slot      s_out {"value", descriptor_of<T>, slot_dir::out, slot_card::single};
+            static constexpr const slot *arr[] = {&s_in, &s_out};
+            return arr;
+        }
+
+        auto
+        properties() -> node_properties & override
+        {
+            return props_;
+        }
+
+        auto
+        slot_values() -> node_properties & override
+        {
+            return vals_;
+        }
+
+        auto
+        activate(std::span<const input_pair> inputs, std::span<output_pair> outputs, const activate_context & /*ctx*/) -> activate_result override
+        {
+            const auto *wired = find_input(inputs, "in");
+            const auto *v     = wired ? aa::any_cast<T>(wired) : nullptr;
+            if (!v)
+            {
+                return std::unexpected(failure {"value not set (connect 'in' or type an inline value)"});
+            }
+            for (auto &[slot_id, out] : outputs)
+            {
+                if (slot_id == "value")
+                {
+                    *out = *v;
+                    return {};
+                }
+            }
+            return std::unexpected(failure {"no 'value' slot on " + id_});
+        }
+
+      private:
+
+        std::string id_;
+        props       props_;
+        props       vals_;
+    };
+
+    template<typename T>
+    class typed_constant_factory final : public node_factory
+    {
+      public:
+
+        auto
+        type_id() const -> std::string_view override
+        {
+            return constant_traits<T>::type_id;
+        }
+
+        auto
+        display_name() const -> std::string_view override
+        {
+            return constant_traits<T>::display_name;
+        }
+
+        auto
+        category() const -> std::string_view override
+        {
+            return "Basic Types";
+        }
+
+        auto
+        domains() const -> std::span<const std::string_view> override
+        {
+            static constexpr std::string_view ds[] = {"basic/types"};
+            return ds;
+        }
+
+        auto
+        create() const -> std::unique_ptr<node> override
+        {
+            return std::make_unique<typed_constant_node<T>>();
+        }
+
+        auto
+        create_with_id(std::string_view instance_id) const
+                -> std::unique_ptr<node> override
+        {
+            return std::make_unique<typed_constant_node<T>>(std::string {instance_id});
+        }
+    };
+
+    // ---------------------------------------------------------------------------
     // basic.view — debug tap, accepts any type. The View panel pulls the
     // upstream value directly via the runner.
     // ---------------------------------------------------------------------------
@@ -1296,6 +1455,10 @@ cc_plugin_register(cc::host_registry &r)
     }
 
     // ---- node factories ----
+    r.register_node_factory(std::make_unique<typed_constant_factory<std::string>>());
+    r.register_node_factory(std::make_unique<typed_constant_factory<long>>());
+    r.register_node_factory(std::make_unique<typed_constant_factory<double>>());
+    r.register_node_factory(std::make_unique<typed_constant_factory<bool>>());
     r.register_node_factory(std::make_unique<path_factory>());
     r.register_node_factory(std::make_unique<get_file_factory>());
     r.register_node_factory(std::make_unique<get_or_create_factory>());

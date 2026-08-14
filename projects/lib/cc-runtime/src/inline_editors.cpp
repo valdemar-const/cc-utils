@@ -130,4 +130,16 @@ register_inline_editors(host_registry &host) -> void
     t.register_inline_editor("File", property_kind::path, parse_file);
 }
 
+auto
+register_value_editors(host_registry &host) -> void
+{
+    auto &t = host.types();
+    // Globally unique namespaced ids: the id IS the editor's identity —
+    // the workbench maps it onto a widget, and the same id may serve
+    // several resource types (plain text fits both String and Path).
+    t.register_value_editor("String", "editors.text.plain");
+    t.register_value_editor("String", "editors.text.code");
+    t.register_value_editor("Path", "editors.text.plain");
+}
+
 } // namespace cc::runtime

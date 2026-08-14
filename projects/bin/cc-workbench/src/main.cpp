@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cfloat>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -194,6 +195,7 @@ header_color_for_category(std::string_view category) -> ImVec4
 }
 
 constexpr std::string_view kViewTabIcon = "\xf0\x9f\x91\x81"; // 👁 U+1F441 EYE
+constexpr std::string_view kEditTabIcon = "\xe2\x9c\x8f";     // ✏ U+270F PENCIL
 
 // ---------------------------------------------------------------------------
 // Per-tab View state. Each View tab is an independent "television" that can
@@ -217,6 +219,32 @@ struct ViewTab
     std::string                                                       pull_target;
     bool                                                              pull_running     = false;
     unsigned                                                          pull_started_gen = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Per-tab Editor state — a full-size value editor ("open with editor…")
+// bound to one model: an input pin's inline value (slot_values()) or a
+// footer property (properties()). Blender-style panels: open as many
+// tabs as you like, even identical editors — they all edit the one
+// node-side text and sync through it. Parsing/validation is the shared
+// type_registry::parse_value.
+// ---------------------------------------------------------------------------
+struct EditorTab
+{
+    int                   seq = 0;      // monotonic id for unique window label
+    std::string           window_label; // "✏ …###e<seq>" — stable ImGui ID
+    std::string           instance;     // target node instance_id
+    std::string           slot;         // input slot id — or property key (prop=true)
+    bool                  prop = false; // target is a footer property, not a pin
+    std::string           editor;       // editor id from the catalog (e.g. "editors.text.plain")
+    cc::type_descriptor_t type {};      // validator type (pin type / kind→type)
+
+    std::string buf;    // live edit buffer (CallbackResize target)
+    std::string synced; // node-side text when last synced (external changes)
+
+    // "Code" editor widget — created lazily, owned per tab (Blender-style
+    // panels: several tabs, even identical editors, may share one value).
+    std::unique_ptr<TextEditor> code;
 };
 
 // ---------------------------------------------------------------------------
@@ -317,6 +345,26 @@ struct AppState
     std::string          last_view_source; // last-used source (for new tabs)
     int                  next_view_seq       = 1;
     unsigned             view_invalidate_gen = 0;
+
+    // Editor tabs — full-size value editors, one DockableWindow per opened
+    // pin value (see EditorTab).
+    std::vector<EditorTab> editor_tabs;
+    int                    next_editor_seq = 1;
+
+    // "Open with editor…" chooser — a centered modal (see draw_editor_chooser).
+    struct
+    {
+        bool                  open = false;
+        std::string           instance;
+        std::string           slot;
+        bool                  prop = false;
+        cc::type_descriptor_t type {};
+    } editor_chooser;
+
+    // Tooltip text set while inside ed::Begin/End (where opening a real
+    // tooltip window would corrupt the editor's draw-channel state) and
+    // flushed right after ed::End() — see draw_resource_editor_entry.
+    std::string pending_tooltip;
 
     // Fonts
     ImFont *ui_font   = nullptr;
@@ -982,6 +1030,79 @@ void poll_file_dialog();
 void request_open_pipeline_dialog();
 void request_save_as_dialog();
 void do_save_or_save_as();
+void open_editor_tab(const std::string &instance, const std::string &key, const std::string &editor, cc::type_descriptor_t type, bool property);
+
+// ---------------------------------------------------------------------------
+// Resource editors — the through mechanism.
+//
+// A "resource" is ANY editable value behind the graph: an unconnected
+// input pin's inline value (typed by the pin's connection type) or a node
+// property (a private, non-connectable input field typed by its kind). For
+// every resource type the host registry may hold:
+//   - exactly ONE inplace editor (control kind + shared parser), and
+//   - N full-size editors under globally unique namespaced ids
+//     ("editors.text.plain", "editors.text.code", ...).
+// Pin rows and property rows enter through the SAME pair of helpers below
+// (the onRenderNodePinHook / onRenderNodePropertyHook of this workbench):
+// resource_type_of() resolves the resource's type, draw_resource_editor_entry()
+// renders the generic pencil — the entry point into the editor catalog
+// (exactly one editor opens directly; several open the chooser window).
+// ---------------------------------------------------------------------------
+
+// Property kind → canonical connection type. Editor registration stays
+// TYPE-keyed (never node-keyed): whatever a pin and a property share in
+// type, they share in editors too.
+auto
+resource_type_of(cc::property_kind kind) -> cc::type_descriptor_t
+{
+    switch (kind)
+    {
+    case cc::property_kind::integer:
+        return g_state.host->types().descriptor_of_name("Integer");
+    case cc::property_kind::boolean:
+        return g_state.host->types().descriptor_of_name("Boolean");
+    case cc::property_kind::path:
+        return g_state.host->types().descriptor_of_name("Path");
+    case cc::property_kind::text:
+    case cc::property_kind::multiline:
+    default:
+        return g_state.host->types().descriptor_of_name("String");
+    }
+}
+
+void
+draw_resource_editor_entry(cc::node &n, std::string_view key, cc::type_descriptor_t type, bool property)
+{
+    const auto editors = g_state.host->types().value_editors_of(type);
+    if (editors.empty())
+    {
+        return; // no full-size editors for this resource type — no pencil
+    }
+    if (ImGui::SmallButton("\xe2\x9c\x8f##open_editor"))
+    {
+        if (editors.size() == 1)
+        {
+            open_editor_tab(std::string {n.instance_id()}, std::string {key}, std::string {editors.front()}, type, property);
+        }
+        else
+        {
+            g_state.editor_chooser.open     = true;
+            g_state.editor_chooser.instance = std::string {n.instance_id()};
+            g_state.editor_chooser.slot     = std::string {key};
+            g_state.editor_chooser.prop     = property;
+            g_state.editor_chooser.type     = type;
+            log("editor entry: chooser requested on " + std::string {n.instance_id()} + "." + std::string {key});
+        }
+    }
+    if (ImGui::IsItemHovered())
+    {
+        // DEFERRED tooltip: SetTooltip inside ed::Begin/End opens a
+        // top-level window that corrupts the editor's draw-channel state
+        // (gray canvas smear, shifted node content). The pending text is
+        // flushed right after ed::End(), where plain windows are safe.
+        g_state.pending_tooltip = editors.size() > 1 ? "Open with editor…" : "Open with editor";
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Schema-driven property widgets
@@ -1077,6 +1198,19 @@ draw_property_widget(cc::node &n, cc::node_properties &store, const cc::property
             break;
         }
     }
+
+    // The generic editor entry (pencil) — same through-mechanism as pin
+    // rows: resource_type_of maps the kind onto the canonical type, the
+    // catalog decides whether a full-size editor exists for it. SameLine is
+    // issued ONLY when the pencil will actually render — a dangling SameLine
+    // would glue the next property row onto this line (the footer is a plain
+    // vertical flow, unlike the stacklayout pin rows).
+    const auto res_type = resource_type_of(desc.kind);
+    if (!g_state.host->types().value_editors_of(res_type).empty())
+    {
+        ImGui::SameLine();
+        draw_resource_editor_entry(n, desc.key, res_type, true);
+    }
     ImGui::PopID();
 }
 
@@ -1118,6 +1252,9 @@ enum class pin_row_mode
     annotation // `:short` type label, for types without an editor
 };
 
+void draw_editor_window(EditorTab &tab);
+void draw_editor_chooser();
+
 void
 draw_pin_value_field(cc::node &n, const cc::slot &s, pin_row_mode mode)
 {
@@ -1125,6 +1262,9 @@ draw_pin_value_field(cc::node &n, const cc::slot &s, pin_row_mode mode)
     {
         ImGui::Spring(0);
         ImGui::TextDisabled("%s", pin_annotation_of(&s).c_str());
+        // No inplace editor for this type — but full-size editors may still
+        // exist in the catalog (the two sets are independent).
+        draw_resource_editor_entry(n, s.id(), s.type(), false);
         return;
     }
 
@@ -1196,6 +1336,14 @@ draw_pin_value_field(cc::node &n, const cc::slot &s, pin_row_mode mode)
             break;
         }
     }
+
+    // Generic editor entry (pencil) — the SAME through-mechanism as property
+    // rows. NOT gated on `ghost`: the button must be submitted (and merely
+    // culled by the degenerate clip) in every mode, so the row geometry is
+    // pixel-stable when a wire connects/disconnects. A culled button reports
+    // no hover and takes no interaction — the connected pin's value comes
+    // from the wire, so opening an editor there is meaningless anyway.
+    draw_resource_editor_entry(n, s.id(), s.type(), false);
     ImGui::PopID();
 
     if (ghost)
@@ -2714,6 +2862,14 @@ draw_pipeline_canvas()
     ed::End();
     ed::SetCurrentEditor(nullptr);
 
+    // Flush the deferred canvas tooltip (set while the editor context was
+    // live — see draw_resource_editor_entry).
+    if (!g_state.pending_tooltip.empty())
+    {
+        ImGui::SetTooltip("%s", g_state.pending_tooltip.c_str());
+        g_state.pending_tooltip.clear();
+    }
+
     // Render the menu OUTSIDE ed::Begin/End so it's a plain ImGui window,
     // not affected by the editor's draw channels.
     draw_create_menu();
@@ -2781,6 +2937,296 @@ poll_view_tabs()
         {
             ++it;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Editor tabs — full-size value editors ("open with editor…").
+// ---------------------------------------------------------------------------
+
+// InputTextMultiline bound to a std::string via the canonical
+// CallbackResize pattern (the ImGui char* API owns no storage).
+auto
+input_text_resize(ImGuiInputTextCallbackData *data) -> int
+{
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackResize)
+    {
+        auto *str = static_cast<std::string *>(data->UserData);
+        str->resize(static_cast<std::size_t>(data->BufTextLen));
+        data->Buf = str->data();
+    }
+    return 0;
+}
+
+void
+open_editor_tab(const std::string &instance, const std::string &slot, const std::string &editor, cc::type_descriptor_t type, bool property)
+{
+    // No dedup — Blender-style panels: every click opens another tab, even
+    // for the same (node, slot, editor); they all edit the one model below.
+    int   seq        = g_state.next_editor_seq++;
+    auto &tab        = g_state.editor_tabs.emplace_back();
+    tab.seq          = seq;
+    tab.window_label = std::string {kEditTabIcon} + " " + editor + "###e" + std::to_string(seq);
+    tab.instance     = instance;
+    tab.slot         = slot;
+    tab.prop         = property;
+    tab.editor       = editor;
+    tab.type         = type;
+    log("editor tab opened: " + editor + " on " + instance + "." + slot + (property ? " (property)" : " (pin)"));
+
+    HelloImGui::DockableWindow w;
+    w.label         = tab.window_label;
+    w.dockSpaceName = "BottomSpace";
+    w.canBeClosed   = true;
+    int cap_seq     = seq;
+    w.GuiFunction   = [cap_seq]()
+    {
+        for (auto &t : g_state.editor_tabs)
+        {
+            if (t.seq == cap_seq)
+            {
+                draw_editor_window(t);
+                return;
+            }
+        }
+    };
+    HelloImGui::AddDockableWindow(w);
+}
+
+// Mirror of poll_view_tabs for Editor tabs (X-button teardown).
+void
+poll_editor_tabs()
+{
+    auto &docks = HelloImGui::GetRunnerParams()->dockingParams.dockableWindows;
+    for (auto it = g_state.editor_tabs.begin(); it != g_state.editor_tabs.end();)
+    {
+        auto dw_it = std::find_if(
+                docks.begin(), docks.end(), [&](const HelloImGui::DockableWindow &dw)
+                {
+                    return dw.label == it->window_label;
+                }
+        );
+
+        if (dw_it != docks.end() && !dw_it->isVisible)
+        {
+            HelloImGui::RemoveDockableWindow(it->window_label);
+            it = g_state.editor_tabs.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+}
+
+void
+draw_editor_window(EditorTab &tab)
+{
+    cc::node *n = g_state.g.find_node(tab.instance);
+    if (!n)
+    {
+        ImGui::TextDisabled("node removed");
+        return;
+    }
+    const cc::slot *slot = nullptr;
+    if (!tab.prop)
+    {
+        for (auto *s : n->slots())
+        {
+            if (s->dir() == cc::slot_dir::in && s->id() == tab.slot)
+            {
+                slot = s;
+                break;
+            }
+        }
+        if (!slot)
+        {
+            ImGui::TextDisabled("slot removed");
+            return;
+        }
+    }
+
+    // Sync the window title with the live target ("✏ Text — node#3.text###e1").
+    {
+        std::string suffix = "###e" + std::to_string(tab.seq);
+        std::string title  = std::string {kEditTabIcon} + " " + tab.editor + " — " + tab.instance + "." + tab.slot + suffix;
+        if (title != tab.window_label)
+        {
+            tab.window_label = title;
+            auto &docks      = HelloImGui::GetRunnerParams()->dockingParams.dockableWindows;
+            for (auto &dw : docks)
+            {
+                if (dw.label.find(suffix) != std::string::npos)
+                {
+                    dw.label = title;
+                    break;
+                }
+            }
+        }
+    }
+
+    // The model: a pin's inline value (slot_values) or a footer property
+    // (properties) — both are node-side text the tab renders a view of.
+    auto       &model = tab.prop ? n->properties() : n->slot_values();
+    std::string current {model.get(tab.slot)};
+    bool        model_changed_elsewhere = (current != tab.synced);
+    tab.synced                          = current;
+
+    // Shared validator — the very parse the runner applies to the inline
+    // text, so the tab shows exactly what a run would reject. Drawn first:
+    // the editor below then fills all the remaining space.
+    std::string pipeline_dir;
+    if (!g_state.pipeline_path.empty())
+    {
+        pipeline_dir = std::filesystem::path {g_state.pipeline_path}.parent_path().string();
+    }
+    auto parsed = g_state.host->types().parse_value(tab.type, tab.buf, pipeline_dir);
+    if (!parsed)
+    {
+        ImGui::TextDisabled("invalid: %s", parsed.error().c_str());
+    }
+
+    if (tab.editor == "editors.text.plain")
+    {
+        if (g_state.mono_font)
+        {
+            ImGui::PushFont(g_state.mono_font);
+        }
+        bool changed = ImGui::InputTextMultiline(
+                "##editor_value", tab.buf.data(), tab.buf.capacity() + 1, ImVec2(-FLT_MIN, -FLT_MIN), ImGuiInputTextFlags_CallbackResize, input_text_resize, &tab.buf
+        );
+        if (g_state.mono_font)
+        {
+            ImGui::PopFont();
+        }
+        if (changed)
+        {
+            model.set(tab.slot, tab.buf);
+            invalidate_view_cache();
+        }
+        else if (model_changed_elsewhere && current != tab.buf && !ImGui::IsItemActive())
+        {
+            tab.buf = current;
+        }
+    }
+    else if (tab.editor == "editors.text.code")
+    {
+        if (!tab.code)
+        {
+            tab.code = std::make_unique<TextEditor>();
+            tab.code->SetPalette(TextEditor::GetDarkPalette());
+            tab.code->SetLanguage(TextEditor::Language::Cpp()); // .tl is C-like
+            tab.code->SetText(current);
+            tab.buf = current;
+        }
+        if (model_changed_elsewhere && current != tab.buf)
+        {
+            tab.buf = current;
+            tab.code->SetText(current);
+        }
+        if (g_state.mono_font)
+        {
+            ImGui::PushFont(g_state.mono_font);
+        }
+        tab.code->Render("##editor_code", ImVec2(-FLT_MIN, -FLT_MIN), false);
+        if (g_state.mono_font)
+        {
+            ImGui::PopFont();
+        }
+        std::string text = tab.code->GetText();
+        if (text != tab.buf)
+        {
+            tab.buf = std::move(text);
+            model.set(tab.slot, tab.buf);
+            invalidate_view_cache();
+        }
+    }
+    else
+    {
+        ImGui::TextDisabled("no such editor: '%s'", tab.editor.c_str());
+    }
+}
+
+// "Open with editor…" chooser — a CENTERED MODAL, driven exactly like the
+// load-error modal (latched open + OpenPopup + BeginPopupModal). A
+// canvas-anchored plain window is not usable here: item rects submitted
+// inside the suspended node-editor can come back in canvas-local
+// coordinates (cf. the create-menu MouseClickedPos note), which placed the
+// transient window off-viewport — "open" per the log, yet invisible. The
+// modal also removes the click-outside race entirely (modal input grab).
+void
+draw_editor_chooser()
+{
+    static bool should_open = false;
+    if (g_state.editor_chooser.open)
+    {
+        should_open                 = true;
+        g_state.editor_chooser.open = false;
+    }
+    if (should_open)
+    {
+        ImGui::OpenPopup("Open with editor");
+        should_open = false;
+    }
+    if (!ImGui::IsPopupOpen("Open with editor"))
+    {
+        return;
+    }
+
+    auto &ch = g_state.editor_chooser;
+
+    cc::node *n = g_state.g.find_node(ch.instance);
+    if (!n)
+    {
+        return;
+    }
+    const cc::slot *slot = nullptr;
+    if (!ch.prop)
+    {
+        for (auto *s : n->slots())
+        {
+            if (s->dir() == cc::slot_dir::in && s->id() == ch.slot)
+            {
+                slot = s;
+                break;
+            }
+        }
+    }
+    const auto editors = (slot || ch.prop) ? g_state.host->types().value_editors_of(ch.type)
+                                           : std::vector<std::string_view> {};
+
+    ImGui::SetNextWindowSize(ImVec2(380, 0));
+    if (ImGui::BeginPopupModal("Open with editor", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings))
+    {
+        if (!slot && !ch.prop)
+        {
+            ImGui::TextDisabled("slot removed");
+        }
+        else if (editors.size() <= 1)
+        {
+            ImGui::TextDisabled("no editor choice available");
+        }
+        else
+        {
+            ImGui::TextDisabled("%s.%s", ch.instance.c_str(), ch.slot.c_str());
+            ImGui::Spacing();
+            for (std::string_view ed : editors)
+            {
+                if (ImGui::Selectable(std::string {ed}.c_str(), false, ImGuiSelectableFlags_AllowDoubleClick))
+                {
+                    open_editor_tab(ch.instance, ch.slot, std::string {ed}, ch.type, ch.prop);
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+            ImGui::Spacing();
+            float bw = 120.0f;
+            ImGui::SetCursorPosX(ImGui::GetContentRegionAvail().x - bw + ImGui::GetCursorPosX());
+            if (ImGui::Button("Cancel", ImVec2(bw, 0)))
+            {
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::EndPopup();
     }
 }
 
@@ -3720,6 +4166,10 @@ main()
     // nodes and vendors. A dedicated workbench-plugin API would register
     // further editors through the same entry point.
     cc::runtime::register_inline_editors(*g_state.host);
+    // Named value-editor catalog ("open with editor…"): today only String →
+    // "Text". The catalog is open — further editors register through the
+    // same type_registry::register_value_editor entry point.
+    cc::runtime::register_value_editors(*g_state.host);
     g_state.loaded_plugins = loaded;
     log(std::string {"cc-workbench ready. plugins loaded: "} + std::to_string(loaded));
     log(std::string {"node types registered: "} + std::to_string(g_state.host->node_factories().size()));
@@ -3755,12 +4205,14 @@ main()
         }
 
         poll_view_tabs();
+        poll_editor_tabs();
 
         draw_about_popup();
         draw_load_error_modal();
         draw_load_warnings_modal();
         draw_unsaved_confirm_modal();
         draw_new_pipeline_dialog();
+        draw_editor_chooser();
     };
 
     // Bottom dock for View + Logger (~40%).

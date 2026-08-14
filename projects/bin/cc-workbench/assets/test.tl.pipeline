@@ -23,8 +23,8 @@
       type="filesystem.path"
       id="filesystem.path#1">
       <pos
-        x="-920"
-        y="124" />
+        x="-1079"
+        y="122" />
       <properties />
       <values>
         <value
@@ -35,7 +35,7 @@
       type="filesystem.get_file"
       id="filesystem.get_file#41">
       <pos
-        x="-516"
+        x="-614"
         y="124" />
       <properties />
       <values />
@@ -44,7 +44,7 @@
       type="filesystem.read_text"
       id="filesystem.read_text#77">
       <pos
-        x="-104"
+        x="-155"
         y="124" />
       <properties />
       <values />
@@ -53,7 +53,7 @@
       type="tl.frontend"
       id="tl.frontend#117">
       <pos
-        x="296"
+        x="245"
         y="124" />
       <properties />
       <values />
@@ -106,7 +106,7 @@
       type="basic.view"
       id="basic.view#2030">
       <pos
-        x="2296"
+        x="2344"
         y="124" />
       <properties>
         <property

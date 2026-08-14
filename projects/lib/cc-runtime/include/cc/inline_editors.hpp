@@ -26,4 +26,19 @@ namespace cc::runtime
 
 CC_RUNTIME_API auto register_inline_editors(host_registry &host) -> void;
 
+// Register the default catalog of named value editors ("open with
+// editor…") — the rich counterparts of the inline controls, opened by the
+// workbench in dedicated Editor tabs. Same host-layer entry point as above:
+// the registry only maps resource type name → editor ids; the editor
+// widgets themselves live in the workbench and dispatch on the id. Ids are
+// globally unique and namespaced ("editors.<family>.<flavour>"), and one
+// id may serve several types. Today: "editors.text.plain" (multiline) and
+// "editors.text.code" (syntax-highlighted) for String;
+// "editors.text.plain" for Path (footer path properties open there too).
+// Tabs share the one model — the node's slot_values()/properties() text —
+// so several editors (even identical ones, or the inline pin control)
+// stay in sync automatically.
+
+CC_RUNTIME_API auto register_value_editors(host_registry &host) -> void;
+
 } // namespace cc::runtime

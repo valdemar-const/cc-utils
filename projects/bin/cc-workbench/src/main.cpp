@@ -33,6 +33,7 @@
 #include "pipeline_xml.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -2978,6 +2979,332 @@ draw_view_window(ViewTab &tab)
 }
 
 // ---------------------------------------------------------------------------
+// Metadata tab — the pipeline document's vocabulary settings.
+//
+// Sections:
+//   1. Contract — the current root domain (immutable) + imports (add-only,
+//      per plans/domains.md §3). Adding an import widens the palette of the
+//      create menu / drag palette immediately (visibility is recomputed
+//      per frame from {root ∪ imports}).
+//   2. Register domain — seed a custom vocabulary domain into the host
+//      registry at runtime (no plugin needed). Session-only: not persisted
+//      into the .pipeline file; imports of it survive on disk but warn on
+//      load after a restart.
+//   3. Registry — every loaded domain with its metadata, provided types and
+//      the node types that declared membership in it.
+//   4. Plugins — loaded plugin names with their node-type counts.
+// ---------------------------------------------------------------------------
+void
+draw_metadata_window()
+{
+    const auto &domains = g_state.host->domains();
+
+    // ---- 1. Document contract ----
+    ImGui::SeparatorText("Pipeline contract");
+    if (g_state.domains.root.empty())
+    {
+        ImGui::TextWrapped("No domain contract yet — legacy (v1) pipeline or nothing opened.");
+        ImGui::TextDisabled("File → New picks a root domain; saving a legacy pipeline offers a migration.");
+    }
+    else
+    {
+        const auto *root = g_state.host->find_domain(g_state.domains.root);
+        ImGui::Text("Root domain (immutable): %s", root && !root->display_name.empty() ? root->display_name.c_str() : g_state.domains.root.c_str());
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%s)", g_state.domains.root.c_str());
+
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Imports:");
+        if (g_state.domains.imports.empty())
+        {
+            ImGui::TextDisabled("  (none)");
+        }
+        // Removal is allowed while safe: after dropping the import, every
+        // node already placed on the canvas must stay visible (at least one
+        // of its own domains still within the shrunk closure). The precise
+        // check covers both nodes OF the domain and nodes that reached their
+        // vocabulary only through its transitive dependency chain.
+        int remove_idx = -1;
+        for (std::size_t i = 0; i < g_state.domains.imports.size(); ++i)
+        {
+            const std::string &imp = g_state.domains.imports[i];
+            ImGui::PushID(imp.c_str());
+            ImGui::BulletText("%s", imp.c_str());
+            ImGui::SameLine();
+
+            std::vector<std::string_view> roots;
+            roots.push_back(g_state.domains.root);
+            for (std::size_t j = 0; j < g_state.domains.imports.size(); ++j)
+            {
+                if (j != i)
+                {
+                    roots.push_back(g_state.domains.imports[j]);
+                }
+            }
+            const auto                  shrunk_v = g_state.host->domain_closure(roots);
+            const std::set<std::string> still {shrunk_v.begin(), shrunk_v.end()};
+            std::vector<std::string>    orphans;
+            for (const auto &np : g_state.g.nodes())
+            {
+                bool visible = false;
+                if (auto *f = g_state.host->find_node_factory(np->type_id()))
+                {
+                    for (auto d : f->domains())
+                    {
+                        if (still.count(std::string {d}))
+                        {
+                            visible = true;
+                            break;
+                        }
+                    }
+                }
+                if (!visible)
+                {
+                    orphans.emplace_back(np->type_id());
+                }
+            }
+
+            if (orphans.empty())
+            {
+                if (ImGui::SmallButton("remove"))
+                {
+                    remove_idx = static_cast<int>(i);
+                }
+            }
+            else
+            {
+                ImGui::BeginDisabled();
+                ImGui::SmallButton("remove");
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                {
+                    ImGui::SetTooltip("removing would hide %zu placed node(s) from the palette\n(first: %s)", orphans.size(), orphans.front().c_str());
+                }
+            }
+            ImGui::PopID();
+        }
+        if (remove_idx >= 0)
+        {
+            const auto        it      = g_state.domains.imports.begin() + remove_idx;
+            const std::string removed = *it;
+            g_state.domains.imports.erase(it);
+            g_state.pipeline_dirty = true; // the contract is part of the file
+            log("metadata: removed import '" + removed + "'");
+        }
+
+        // Add import: FREE — every registered domain except the root and
+        // domains already imported explicitly. A domain that is already
+        // visible TRANSITIVELY may still be pinned as an explicit import:
+        // the explicit edge survives even if the upstream domain later
+        // drops the dependency from its own depends_on list.
+        std::set<std::string> explicit_ids {g_state.domains.root};
+        explicit_ids.insert(g_state.domains.imports.begin(), g_state.domains.imports.end());
+        std::vector<std::string> addable;
+        for (const auto &d : domains)
+        {
+            if (!explicit_ids.count(d.id))
+            {
+                addable.push_back(d.id);
+            }
+        }
+        if (addable.empty())
+        {
+            ImGui::TextDisabled("every registered domain is already imported");
+        }
+        else
+        {
+            static int                pick = 0;
+            std::vector<const char *> items;
+            items.reserve(addable.size());
+            for (const auto &id : addable)
+            {
+                items.push_back(id.c_str());
+            }
+            if (pick >= static_cast<int>(items.size()))
+            {
+                pick = 0;
+            }
+            ImGui::SetNextItemWidth(260);
+            ImGui::Combo("##add_import", &pick, items.data(), static_cast<int>(items.size()));
+            ImGui::SameLine();
+            if (ImGui::Button("Add import"))
+            {
+                const std::string id = addable[static_cast<std::size_t>(pick)];
+                g_state.domains.imports.push_back(id);
+                g_state.pipeline_dirty = true; // the contract is part of the file
+                log("metadata: imported domain '" + id + "'");
+            }
+        }
+    }
+
+    // ---- 2. Register a custom domain ----
+    ImGui::SeparatorText("Register domain");
+    static char                  dom_id[128]   = "";
+    static char                  dom_name[128] = "";
+    static char                  dom_desc[256] = "";
+    static std::set<std::string> dom_deps;
+
+    auto label_of = [&](std::string_view id) -> std::string
+    {
+        const auto *d = g_state.host->find_domain(id);
+        return d && !d->display_name.empty() ? d->display_name : std::string {id};
+    };
+
+    ImGui::SetNextItemWidth(200);
+    ImGui::InputTextWithHint("id##dom_id", "my/domain", dom_id, sizeof(dom_id));
+    ImGui::SetNextItemWidth(200);
+    ImGui::InputTextWithHint("display name##dom_name", "My Domain", dom_name, sizeof(dom_name));
+    ImGui::SetNextItemWidth(340);
+    ImGui::InputTextWithHint("description##dom_desc", "what this vocabulary is for", dom_desc, sizeof(dom_desc));
+
+    if (!domains.empty())
+    {
+        ImGui::TextUnformatted("depends on:");
+        for (const auto &d : domains)
+        {
+            ImGui::PushID(d.id.c_str());
+            bool tick = dom_deps.count(d.id) != 0;
+            if (ImGui::Checkbox(label_of(d.id).c_str(), &tick))
+            {
+                if (tick)
+                {
+                    dom_deps.insert(d.id);
+                }
+                else
+                {
+                    dom_deps.erase(d.id);
+                }
+            }
+            ImGui::PopID();
+        }
+    }
+
+    {
+        const std::string id {dom_id};
+        bool              ok = !id.empty();
+        for (char c : id)
+        {
+            ok = ok && (std::isalnum(static_cast<unsigned char>(c)) || c == '/' || c == '_' || c == '-' || c == '.');
+        }
+        ok = ok && g_state.host->find_domain(id) == nullptr;
+
+        ImGui::BeginDisabled(!ok);
+        if (ImGui::Button("Register"))
+        {
+            cc::domain_desc d;
+            d.id           = id;
+            d.display_name = dom_name;
+            d.description  = dom_desc;
+            d.depends_on.assign(dom_deps.begin(), dom_deps.end());
+            g_state.host->register_domain(std::move(d));
+            log("metadata: registered domain '" + id + "'");
+            dom_id[0]   = 0;
+            dom_name[0] = 0;
+            dom_desc[0] = 0;
+            dom_deps.clear();
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ok)
+        {
+            ImGui::TextDisabled("seeds the registry; nodes join it via factory::domains()");
+        }
+        else if (!id.empty())
+        {
+            ImGui::TextUnformatted("id must be unique, [a-z0-9/._-]");
+        }
+    }
+    ImGui::TextDisabled("Runtime domains live until the app closes — they are not persisted in the .pipeline file.");
+
+    // ---- 3. Domain registry ----
+    ImGui::SeparatorText("Domain registry");
+    if (domains.empty())
+    {
+        ImGui::TextDisabled("(no domains registered — load a plugin that seeds one)");
+    }
+    for (const auto &d : domains)
+    {
+        const std::string title = label_of(d.id) + "  (" + d.id + ")";
+        if (!ImGui::CollapsingHeader(title.c_str()))
+        {
+            continue;
+        }
+        ImGui::Indent();
+        if (!d.description.empty())
+        {
+            ImGui::TextWrapped("%s", d.description.c_str());
+        }
+        if (!d.depends_on.empty())
+        {
+            std::string deps = "depends on: ";
+            for (std::size_t i = 0; i < d.depends_on.size(); ++i)
+            {
+                if (i)
+                {
+                    deps += ", ";
+                }
+                deps += d.depends_on[i];
+            }
+            ImGui::TextDisabled("%s", deps.c_str());
+        }
+        if (!d.provided_types.empty())
+        {
+            std::string types = "types: ";
+            for (std::size_t i = 0; i < d.provided_types.size(); ++i)
+            {
+                if (i)
+                {
+                    types += ", ";
+                }
+                types += d.provided_types[i];
+            }
+            ImGui::TextDisabled("%s", types.c_str());
+        }
+        std::vector<cc::node_factory *> members;
+        for (auto *f : g_state.host->node_factories())
+        {
+            for (auto fd : f->domains())
+            {
+                if (fd == d.id)
+                {
+                    members.push_back(f);
+                    break;
+                }
+            }
+        }
+        if (!members.empty())
+        {
+            std::string nodes = "nodes: ";
+            for (std::size_t i = 0; i < members.size(); ++i)
+            {
+                if (i)
+                {
+                    nodes += ", ";
+                }
+                nodes += members[i]->display_name();
+            }
+            ImGui::TextDisabled("%s", nodes.c_str());
+        }
+        ImGui::Unindent();
+    }
+
+    // ---- 4. Loaded plugins ----
+    ImGui::SeparatorText("Loaded plugins");
+    for (const auto &name : g_state.host->loaded_plugins())
+    {
+        std::size_t count = 0;
+        for (auto *f : g_state.host->node_factories())
+        {
+            if (g_state.host->provider_of(f->type_id()) == name)
+            {
+                ++count;
+            }
+        }
+        ImGui::BulletText("%s — %zu node types", name.c_str(), count);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main menu, About popup, status bar
 // ---------------------------------------------------------------------------
 #ifndef CC_VERSION_STRING
@@ -3023,6 +3350,17 @@ draw_main_menu(HelloImGui::DockingParams &docking)
             if (ImGui::MenuItem("View"))
             {
                 open_view_tab(g_state.last_view_source);
+            }
+            if (ImGui::MenuItem("Metadata"))
+            {
+                for (auto &w : docking.dockableWindows)
+                {
+                    if (w.label == "Metadata")
+                    {
+                        w.isVisible = true;
+                        break;
+                    }
+                }
             }
             ImGui::EndMenu();
         }
@@ -3485,6 +3823,21 @@ main()
         {
             poll_file_dialog();
             draw_pipeline_canvas();
+        };
+        params.dockingParams.dockableWindows.push_back(w);
+    }
+
+    // --- Metadata window (hidden until opened via View → Open tab) ---
+    {
+        HelloImGui::DockableWindow w;
+        w.label             = "Metadata";
+        w.dockSpaceName     = "MainDockSpace";
+        w.canBeClosed       = true;
+        w.isVisible         = false;
+        w.includeInViewMenu = false;
+        w.GuiFunction       = []()
+        {
+            draw_metadata_window();
         };
         params.dockingParams.dockableWindows.push_back(w);
     }

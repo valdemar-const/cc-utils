@@ -21,6 +21,7 @@
 #include "cc/any_value.hpp"
 #include "cc/graph.hpp"
 #include "cc/host_registry.hpp"
+#include "cc/inline_editors.hpp"
 #include "cc/node.hpp"
 #include "cc/node_factory.hpp"
 #include "cc/plugin_loader.hpp"
@@ -61,6 +62,12 @@ void connect(cc::runtime::graph& g,
   g.add_edge(std::move(e));
 }
 
+// Tiny file helper for the inline-editor tests.
+void write_bytes(const std::filesystem::path& p, std::string_view content) {
+  std::ofstream os{p, std::ios::binary | std::ios::trunc};
+  os << content;
+}
+
 }  // namespace
 
 // The full "return 42;" pipeline — text constant to exit code, end-to-end.
@@ -72,6 +79,7 @@ TEST(cc_pipeline, return_42_end_to_end) {
   cc::runtime::plugin_loader loader;
   auto host = cc::runtime::make_host_registry();
   std::size_t loaded = loader.load_all(*host);
+  cc::runtime::register_inline_editors(*host);
   ASSERT_GE(loaded, 4u)
       << "expected at least basic/tl/tl-ir/x86_64 plugins to load; "
       << "is CCP_PLUGIN_PATH set? Got " << loaded << " plugins";
@@ -151,6 +159,7 @@ TEST(cc_pipeline, text_constant_emits_string) {
   cc::runtime::plugin_loader loader;  // outlives host (see teardown note above)
   auto host = cc::runtime::make_host_registry();
   ASSERT_GE(loader.load_all(*host), 1u);
+  cc::runtime::register_inline_editors(*host);
 
   cc::runtime::graph g;
   std::string id = add_node(g, *host, "basic.text.constant");
@@ -170,6 +179,7 @@ TEST(cc_pipeline, domain_registry_closure_and_membership) {
   cc::runtime::plugin_loader loader;
   auto host = cc::runtime::make_host_registry();
   ASSERT_GE(loader.load_all(*host), 4u);
+  cc::runtime::register_inline_editors(*host);
 
   // Seeded domains exist.
   for (std::string_view id : {"basic/types", "filesystem", "basic/text",
@@ -235,6 +245,7 @@ TEST(cc_pipeline, inline_value_injection_and_file_chain) {
   cc::runtime::plugin_loader loader;
   auto host = cc::runtime::make_host_registry();
   ASSERT_GE(loader.load_all(*host), 1u);
+  cc::runtime::register_inline_editors(*host);
 
   auto tmp = std::filesystem::temp_directory_path() / "cc_inline_test.txt";
   {
@@ -275,12 +286,49 @@ TEST(cc_pipeline, inline_value_injection_and_file_chain) {
   }
 }
 
+// The host-layer File editor: the inline text is resolved against
+// pipeline_dir and stat-validated into a real file_handle BEFORE the graph
+// runs — every :file input (e.g. exec's) gets it, uniformly.
+TEST(cc_pipeline, file_inline_editor_materialises_handle) {
+  cc::runtime::plugin_loader loader;
+  auto host = cc::runtime::make_host_registry();
+  ASSERT_GE(loader.load_all(*host), 1u);
+  cc::runtime::register_inline_editors(*host);
+
+  auto tmp = std::filesystem::temp_directory_path() / "cc_file_inline.bin";
+  write_bytes(tmp, "bin");
+
+  const auto file_t = host->types().descriptor_of_name("File");
+  ASSERT_TRUE(file_t != cc::type_descriptor_t{});
+
+  // Inline editor registered for the type — regardless of any node.
+  EXPECT_EQ(host->types().inline_editor_of(file_t), cc::property_kind::path);
+
+  // Relative text resolves against pipeline_dir, absolute passes through.
+  auto rel = host->types().parse_value(
+      file_t, "./cc_file_inline.bin",
+      std::filesystem::temp_directory_path().string());
+  ASSERT_TRUE(rel.has_value()) << rel.error();
+  const auto* h = aa::any_cast<cc::fs::file_handle>(&*rel);
+  ASSERT_NE(h, nullptr);
+  EXPECT_EQ(h->path, tmp.lexically_normal());
+  EXPECT_EQ(h->attrs.size, 3u);
+
+  // Missing file → validator error mentioning the path.
+  auto missing = host->types().parse_value(
+      file_t, "./no_such_file.bin",
+      std::filesystem::temp_directory_path().string());
+  ASSERT_FALSE(missing.has_value());
+  EXPECT_NE(missing.error().find("does not exist"), std::string::npos);
+}
+
 // get_file fails loudly on a missing file (the Optional<File> None case)
 // and get_or_create_file materialises an empty one instead.
 TEST(cc_pipeline, get_file_strict_vs_get_or_create) {
   cc::runtime::plugin_loader loader;
   auto host = cc::runtime::make_host_registry();
   ASSERT_GE(loader.load_all(*host), 1u);
+  cc::runtime::register_inline_editors(*host);
 
   auto missing = std::filesystem::temp_directory_path() / "cc_missing_no_such.file";
   std::error_code ec;

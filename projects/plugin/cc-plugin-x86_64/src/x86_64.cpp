@@ -574,7 +574,7 @@ cc_plugin_register(cc::host_registry &r)
 
     r.push_domain("compiler/backend/x86_64");
     // Module is also registered by cc-plugin-tl-ir; idempotent re-register.
-    r.types().register_value_type<cc::ir::module>({.name = "Module", .short_name = "ir", .description = "platform-neutral IR module", .inline_control = {}, .parse = {}});
+    r.types().register_value_type<cc::ir::module>({.name = "Module", .short_name = "ir", .description = "platform-neutral IR module"});
     r.pop_domain();
     r.register_node_factory(std::make_unique<cc::basic::x86_64::nasm_gen_factory>());
     r.register_node_factory(std::make_unique<cc::basic::x86_64::assemble_factory>());

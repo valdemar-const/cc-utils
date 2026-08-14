@@ -10,6 +10,7 @@
 #include "cc/host.hpp"
 #include "cc/host_registry.hpp"
 #include "cc/graph.hpp"
+#include "cc/inline_editors.hpp"
 #include "cc/node.hpp"
 #include "cc/node_factory.hpp"
 #include "cc/plugin_loader.hpp"
@@ -231,10 +232,13 @@ struct AppState
     std::unordered_map<std::string, int> inst2ed;
 
     // File-dialog target (which node + property key is being picked).
+    // slot_mode routes the picked path into slot_values() (inline pin value)
+    // instead of properties() — the Browse button of an inline pin editor.
     struct
     {
         std::string instance;
         std::string key;
+        bool        slot_mode = false;
     } file_dialog_target;
 
     // Pending SetNodePosition requests — collected when a node is created
@@ -982,8 +986,9 @@ draw_property_widget(cc::node &n, cc::node_properties &store, const cc::property
             ImGui::SameLine();
             if (ImGui::SmallButton("..."))
             {
-                g_state.file_dialog_target.instance = std::string {n.instance_id()};
-                g_state.file_dialog_target.key      = std::string {desc.key};
+                g_state.file_dialog_target.instance  = std::string {n.instance_id()};
+                g_state.file_dialog_target.key       = std::string {desc.key};
+                g_state.file_dialog_target.slot_mode = false;
                 ifd::FileDialog::Instance().Open("node_path", "Open File", ".*", false, (exe_dir() / "assets").string());
             }
             break;
@@ -1044,6 +1049,120 @@ draw_property_widget(cc::node &n, cc::node_properties &store, const cc::property
             {
                 store.set(desc.key, buf);
                 invalidate_view_cache();
+            }
+            break;
+        }
+    }
+    ImGui::PopID();
+}
+
+// Pin annotation: `name:short` (e.g. path:path, text:str). Short name
+// falls back to the canonical name, then to "any" for the wildcard.
+// Exported as a helper: the pin rows and the inline editor (placeholder
+// hint) share the spelling.
+auto
+pin_annotation_of(const cc::slot *s) -> std::string
+{
+    auto full   = g_state.host->types().name_of(s->type());
+    auto shortn = g_state.host->types().short_name_of(s->type());
+    if (shortn.empty())
+    {
+        shortn = full.empty() ? std::string_view {"any"} : full;
+    }
+    return ":" + std::string {shortn};
+}
+
+// ---------------------------------------------------------------------------
+// Inline pin-value editor — compact widget rendered INSIDE the pin row
+// (form F2/F3 of the closed pin-form set: unconnected input whose type has
+// an inline editor). Placeholder carries the type hint ":short". The wire
+// wins: a connected pin renders an inert spacer of the same width instead.
+//
+// The editable region has a FIXED width per editor kind (input + browse
+// button for path-like kinds) so the node neither jumps when a value is
+// typed/cleared nor breathes when a wire is connected/disconnected.
+// New editor kinds (dropdown, slider, ...) extend cc::property_kind + the
+// switch in ONE place.
+// ---------------------------------------------------------------------------
+
+// Width of the fixed inline-editor slot for a control kind, including the
+// browse button where the kind has one.
+auto
+inline_slot_width(cc::property_kind kind) -> float
+{
+    const float browse = ImGui::GetStyle().ItemSpacing.x + ImGui::GetFrameHeight() + 6.0f;
+    switch (kind)
+    {
+    case cc::property_kind::boolean:
+        return ImGui::GetFrameHeight() + 8.0f; // checkbox box
+    case cc::property_kind::integer:
+        return 72.0f;
+    case cc::property_kind::path:
+        return 140.0f + browse;
+    case cc::property_kind::multiline:
+    case cc::property_kind::text:
+    default:
+        return 140.0f;
+    }
+}
+
+void
+draw_inline_pin_widget(cc::node &n, const cc::slot &s)
+{
+    const auto  kind = *g_state.host->types().inline_editor_of(s.type());
+    std::string current {n.slot_values().get(s.id())};
+
+    ImGui::PushID(s.id().data());
+    switch (kind)
+    {
+    case cc::property_kind::boolean:
+        {
+            bool v = (current == "1" || current == "true");
+            if (ImGui::Checkbox("##v", &v))
+            {
+                n.slot_values().set(s.id(), v ? "1" : "0");
+                invalidate_view_cache();
+            }
+            break;
+        }
+    case cc::property_kind::integer:
+    case cc::property_kind::text:
+    case cc::property_kind::multiline:
+    case cc::property_kind::path:
+        {
+            const bool is_int  = kind == cc::property_kind::integer;
+            const bool is_path = kind == cc::property_kind::path;
+            char       buf[256];
+            std::strncpy(buf, current.c_str(), sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = 0;
+
+            // Placeholder doubles as the type hint while no value is entered.
+            std::string ph = pin_annotation_of(&s);
+            if (!ph.empty() && ph.front() == ':')
+            {
+                ph.erase(ph.begin());
+            }
+
+            ImGui::SetNextItemWidth(is_int ? 72.0f : 140.0f);
+            const ImGuiInputTextFlags flags = is_int ? ImGuiInputTextFlags_CharsDecimal : 0;
+            if (ImGui::InputTextWithHint("##v", ph.c_str(), buf, sizeof(buf), flags))
+            {
+                n.slot_values().set(s.id(), buf);
+                invalidate_view_cache();
+            }
+            if (is_path)
+            {
+                // NO SameLine here: the pin row is a stacklayout Horizontal
+                // group, which flows consecutive items side by side on its
+                // own. SameLine() inside it corrupts the layout bookkeeping
+                // and renders the button ON TOP of the input field.
+                if (ImGui::SmallButton("..."))
+                {
+                    g_state.file_dialog_target.instance  = std::string {n.instance_id()};
+                    g_state.file_dialog_target.key       = std::string {s.id()};
+                    g_state.file_dialog_target.slot_mode = true;
+                    ifd::FileDialog::Instance().Open("node_path", "Open File", ".*", false, (exe_dir() / "assets").string());
+                }
             }
             break;
         }
@@ -1495,19 +1614,6 @@ draw_node(cc::node &n)
 
     std::vector<out_pin_t> outputs;
 
-    // Pin annotation: `name:short` (e.g. path:path, text:str). Short name
-    // falls back to the canonical name, then to "any" for the wildcard.
-    auto pin_annotation = [&](const cc::slot *s) -> std::string
-    {
-        auto full   = g_state.host->types().name_of(s->type());
-        auto shortn = g_state.host->types().short_name_of(s->type());
-        if (shortn.empty())
-        {
-            shortn = full.empty() ? std::string_view {"any"} : full;
-        }
-        return ":" + std::string {shortn};
-    };
-
     int slot_idx = 0;
     for (auto *slot : n.slots())
     {
@@ -1524,14 +1630,50 @@ draw_node(cc::node &n)
         }
         ImVec4   pin_color = pin_color_for_type(type_name);
         IconType pin_icon  = icon_for_type(type_name);
-        auto     annot     = pin_annotation(slot);
+        auto     annot     = pin_annotation_of(slot);
+
+        // Pin forms (closed set): a connected input renders bare (F1 — the
+        // wire wins); an unconnected input whose type has an inline editor
+        // renders the editor inside the row (F2 empty / F3 filled); inputs
+        // of opaque types keep the type annotation (F4/F5).
+        const bool has_editor   = g_state.host->types().inline_editor_of(slot->type()).has_value();
+        const bool connected    = g_state.g.find_source(std::string {n.instance_id()}, slot->id()).has_value();
+        const bool editable_row = has_editor && !connected;
 
         b.Input(pin_id);
         Icon(ImVec2(16, 16), pin_icon, true, pin_color, ImVec4(0, 0, 0, 0));
+        if (editable_row)
+        {
+            // Constrain the pin to the icon BEFORE ending it: bounds drive
+            // the hover highlight (drawn in the pin channel ON TOP of node
+            // content), the hit-test and the wire pivot. Without this the
+            // default group rect bleeds over the inline editor row.
+            const ImVec2 icon_min = ImGui::GetItemRectMin();
+            const ImVec2 icon_max = ImGui::GetItemRectMax();
+            ed::PinRect(icon_min, icon_max);
+            // End the pin's hit-test area here: the editor is interactive
+            // but must not become a link-drag source (text selection etc).
+            b.DetachPin();
+        }
         ImGui::Spring(0);
         ImGui::TextUnformatted(slot->id().data());
-        ImGui::Spring(0);
-        ImGui::TextDisabled("%s", annot.c_str());
+        if (editable_row)
+        {
+            draw_inline_pin_widget(n, *slot);
+        }
+        else if (has_editor)
+        {
+            // F1 wired: the wire wins — the editor is gone, but the slot's
+            // FIXED width is reserved as an inert spacer so connecting /
+            // disconnecting does not change the node's width.
+            ImGui::Spring(0);
+            ImGui::Dummy(ImVec2(inline_slot_width(*g_state.host->types().inline_editor_of(slot->type())), 1.0f));
+        }
+        else
+        {
+            ImGui::Spring(0);
+            ImGui::TextDisabled("%s", annot.c_str());
+        }
         b.EndInput();
     }
 
@@ -1544,7 +1686,7 @@ draw_node(cc::node &n)
         }
         ImVec4   pin_color = pin_color_for_type(type_name);
         IconType pin_icon  = icon_for_type(type_name);
-        auto     annot     = pin_annotation(op.slot);
+        auto     annot     = pin_annotation_of(op.slot);
 
         b.Output(op.id);
         ImGui::TextDisabled("%s", annot.c_str());
@@ -1555,66 +1697,13 @@ draw_node(cc::node &n)
         b.EndOutput();
     }
 
-    // ---- Footer: property editor + inline pin values (full width) ----
-    bool has_footer = false;
+    // ---- Footer: property editor (full width, below pins) ----
     if (factory && !factory->property_schema().empty())
     {
-        has_footer = true;
-    }
-    else
-    {
-        for (auto *s : n.slots())
-        {
-            if (s->dir() == cc::slot_dir::in && g_state.host->types().inline_editor_of(s->type()))
-            {
-                has_footer = true;
-                break;
-            }
-        }
-    }
-    if (has_footer)
-    {
         b.Footer();
-        if (factory)
+        for (const auto &desc : factory->property_schema())
         {
-            for (const auto &desc : factory->property_schema())
-            {
-                draw_property_widget(n, n.properties(), desc);
-            }
-        }
-        // Inline editors for unconnected input pins whose type is
-        // inline-editable. A connected pin greys the control out — the wire
-        // wins. Values are stored in slot_values() and injected by the
-        // runner via the type's registered parser.
-        for (auto *s : n.slots())
-        {
-            if (s->dir() != cc::slot_dir::in)
-            {
-                continue;
-            }
-            auto kind = g_state.host->types().inline_editor_of(s->type());
-            if (!kind)
-            {
-                continue;
-            }
-            const bool connected = g_state.g.find_source(std::string {n.instance_id()}, s->id()).has_value();
-            ImGui::PushID(s->id().data());
-            if (connected)
-            {
-                ImGui::BeginDisabled();
-            }
-            cc::property_desc pseudo {
-                    std::string_view {s->id()},
-                    std::string_view {s->id()},
-                    *kind,
-                    std::string_view {""},
-            };
-            draw_property_widget(n, n.slot_values(), pseudo);
-            if (connected)
-            {
-                ImGui::EndDisabled();
-            }
-            ImGui::PopID();
+            draw_property_widget(n, n.properties(), desc);
         }
     }
 
@@ -1879,7 +1968,7 @@ request_action_with_unsaved_check(AppState::pending_action action) -> void
 void
 poll_file_dialog()
 {
-    // ---- node_path: property Browse button ----
+    // ---- node_path: property Browse button / inline pin Browse ----
     if (ifd::FileDialog::Instance().IsDone("node_path"))
     {
         if (ifd::FileDialog::Instance().HasResult())
@@ -1890,13 +1979,23 @@ poll_file_dialog()
                 auto *n = g_state.g.find_node(g_state.file_dialog_target.instance);
                 if (n)
                 {
-                    n->properties().set(g_state.file_dialog_target.key, path);
+                    // slot_mode: the pick feeds an inline pin editor
+                    // (slot_values) rather than a node property.
+                    if (g_state.file_dialog_target.slot_mode)
+                    {
+                        n->slot_values().set(g_state.file_dialog_target.key, path);
+                    }
+                    else
+                    {
+                        n->properties().set(g_state.file_dialog_target.key, path);
+                    }
                     invalidate_view_cache();
                     log("set " + g_state.file_dialog_target.key + " = " + path + " on " + g_state.file_dialog_target.instance);
                 }
             }
             g_last_file_dir = std::filesystem::path(path).parent_path().string();
         }
+        g_state.file_dialog_target.slot_mode = false;
         ifd::FileDialog::Instance().Close();
     }
 
@@ -3208,7 +3307,12 @@ main()
     g_state.host->renderers().register_renderer(std::make_unique<file_view_renderer>());
     g_state.host->renderers().register_renderer(std::make_unique<file_attrs_view_renderer>());
 
-    std::size_t loaded     = g_state.loader.load_all(*g_state.host);
+    std::size_t loaded = g_state.loader.load_all(*g_state.host);
+    // Host-layer editor pack: inline editors for every well-known connection
+    // type (String/Integer/Double/Boolean/Path/File), uniformly across all
+    // nodes and vendors. A dedicated workbench-plugin API would register
+    // further editors through the same entry point.
+    cc::runtime::register_inline_editors(*g_state.host);
     g_state.loaded_plugins = loaded;
     log(std::string {"cc-workbench ready. plugins loaded: "} + std::to_string(loaded));
     log(std::string {"node types registered: "} + std::to_string(g_state.host->node_factories().size()));
@@ -3287,6 +3391,14 @@ main()
         s.Colors[ed::StyleColor_NodeBorder]    = ImVec4(0.30f, 0.30f, 0.36f, 0.80f);
         s.Colors[ed::StyleColor_HovNodeBorder] = ImVec4(0.55f, 0.55f, 0.62f, 1.00f);
         s.Colors[ed::StyleColor_SelNodeBorder] = ImVec4(0.95f, 0.75f, 0.30f, 1.00f);
+        // Pin hover rects render in the pin channel ABOVE node content —
+        // with interactive widgets (inline pin editors) living in the pin
+        // rows, that decoration would draw on top of them. The pin icon
+        // itself already signals the hover; make the rects fully
+        // transparent. (Hit-test / pivot are unaffected: they read the
+        // pin's bounds, not its colours.)
+        s.Colors[ed::StyleColor_PinRect]       = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
+        s.Colors[ed::StyleColor_PinRectBorder] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
 
         ImFileDialogSetupTextureLoader();
     };

@@ -34,6 +34,12 @@ struct BlueprintNodeBuilder
     void Input(PinId id);
     void EndInput();
 
+    // Inside an Input row: end the pin's hit-test area while keeping the
+    // horizontal row open. Widgets submitted afterwards (inline pin editors)
+    // are interactive but do not act as a link-drag source — the pin rect
+    // stays icon+name, and EndInput() skips its own EndPin().
+    void DetachPin();
+
     void Middle();
 
     void Output(PinId id);
@@ -71,9 +77,10 @@ private:
     ImVec2      NodeMax;
     ImVec2      HeaderMin;
     ImVec2      HeaderMax;
-    ImVec2      ContentMin;
-    ImVec2      ContentMax;
-    bool        HasHeader;
+    ImVec2 ContentMin;
+    ImVec2 ContentMax;
+    bool HasHeader;
+    bool PinDetached;
 };
 
 

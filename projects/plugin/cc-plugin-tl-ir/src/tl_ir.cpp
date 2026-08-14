@@ -279,8 +279,8 @@ cc_plugin_register(cc::host_registry &r)
     // cc-plugin-tl also registers Ast — idempotent re-register is a no-op
     // (same name + same descriptor). This keeps the type available even if
     // load order ever changes.
-    r.types().register_value_type<cc::basic::tl::ast_value>({.name = "Ast", .short_name = "ast", .description = "tl syntax tree (shared_ptr<tl_program>)", .inline_control = {}, .parse = {}});
-    r.types().register_value_type<cc::ir::module>({.name = "Module", .short_name = "ir", .description = "platform-neutral IR module", .inline_control = {}, .parse = {}});
+    r.types().register_value_type<cc::basic::tl::ast_value>({.name = "Ast", .short_name = "ast", .description = "tl syntax tree (shared_ptr<tl_program>)"});
+    r.types().register_value_type<cc::ir::module>({.name = "Module", .short_name = "ir", .description = "platform-neutral IR module"});
     r.pop_domain();
     r.register_node_factory(std::make_unique<cc::basic::tl::irgen_factory>());
 }

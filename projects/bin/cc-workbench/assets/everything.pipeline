@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<pipeline
+  version="2"
+  domain="basic/types">
+  <imports>
+    <domain
+      id="filesystem" />
+    <domain
+      id="basic/text" />
+    <domain
+      id="basic/view" />
+    <domain
+      id="system/process" />
+    <domain
+      id="compiler/lang/tl" />
+    <domain
+      id="compiler/backend/x86_64" />
+  </imports>
+  <requires />
+  <nodes />
+  <edges />
+</pipeline>

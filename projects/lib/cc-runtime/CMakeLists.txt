@@ -10,6 +10,7 @@ cc_add_library(${PROJECT_NAME}
     src/graph.cpp
     src/runner.cpp
     src/map_properties.cpp
+    src/inline_editors.cpp
   PUBLIC_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   PUBLIC_HEADERS
@@ -18,8 +19,10 @@ cc_add_library(${PROJECT_NAME}
     include/cc/graph.hpp
     include/cc/runner.hpp
     include/cc/map_properties.hpp
+    include/cc/inline_editors.hpp
   PUBLIC_DEPS
     cc-core::cc-core
+    cc-types-filesystem::cc-types-filesystem
   PRIVATE_DEPS
     Boost::dll
 )

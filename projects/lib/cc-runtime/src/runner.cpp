@@ -54,7 +54,7 @@ runner::pull(std::string_view node_id, std::string_view slot_id)
                 const auto text = n->slot_values().get(slot_id);
                 if (!text.empty())
                 {
-                    auto parsed = types_->parse_value(target->type(), text);
+                    auto parsed = types_->parse_value(target->type(), text, ctx_.pipeline_dir);
                     if (!parsed)
                     {
                         return std::unexpected(failure {"inline value for '" + std::string {slot_id} + "' on node " + std::string {node_id} + ": " + parsed.error()});
@@ -124,7 +124,7 @@ runner::ensure_outputs(std::string_view node_id) -> std::expected<void, failure>
                 const auto text = n->slot_values().get(s->id());
                 if (!text.empty())
                 {
-                    auto parsed = types_->parse_value(s->type(), text);
+                    auto parsed = types_->parse_value(s->type(), text, ctx_.pipeline_dir);
                     if (!parsed)
                     {
                         in_progress_.erase(key);

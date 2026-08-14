@@ -23,19 +23,19 @@
       type="filesystem.path"
       id="filesystem.path#1">
       <pos
-        x="-903"
+        x="-920"
         y="124" />
-      <properties>
-        <property
-          key="value">./examples/42_answer.tl</property>
-      </properties>
-      <values />
+      <properties />
+      <values>
+        <value
+          slot="in">./examples/42_answer.tl</value>
+      </values>
     </node>
     <node
       type="filesystem.get_file"
       id="filesystem.get_file#41">
       <pos
-        x="-316"
+        x="-516"
         y="124" />
       <properties />
       <values />
@@ -44,7 +44,7 @@
       type="filesystem.read_text"
       id="filesystem.read_text#77">
       <pos
-        x="-8"
+        x="-104"
         y="124" />
       <properties />
       <values />
@@ -53,7 +53,7 @@
       type="tl.frontend"
       id="tl.frontend#117">
       <pos
-        x="341"
+        x="296"
         y="124" />
       <properties />
       <values />
@@ -117,11 +117,6 @@
   </nodes>
   <edges>
     <edge
-      src_node="filesystem.path#1"
-      src_slot="path"
-      dst_node="filesystem.get_file#41"
-      dst_slot="path" />
-    <edge
       src_node="filesystem.get_file#41"
       src_slot="file"
       dst_node="filesystem.read_text#77"
@@ -147,14 +142,19 @@
       dst_node="basic.exec#1685"
       dst_slot="file" />
     <edge
-      src_node="basic.exec#1685"
-      src_slot="ret_code"
-      dst_node="basic.view#2030"
-      dst_slot="in" />
+      src_node="filesystem.path#1"
+      src_slot="path"
+      dst_node="filesystem.get_file#41"
+      dst_slot="path" />
     <edge
       src_node="filesystem.read_text#77"
       src_slot="text"
       dst_node="tl.frontend#117"
       dst_slot="src" />
+    <edge
+      src_node="basic.exec#1685"
+      src_slot="ret_code"
+      dst_node="basic.view#2030"
+      dst_slot="in" />
   </edges>
 </pipeline>

@@ -15,38 +15,31 @@ namespace cc
 {
 
 // Parses the text of an inline-edited pin value into a typed any_value.
+// `pipeline_dir` (possibly empty) lets path-bearing editors resolve relative
+// entries against the .pipeline file's directory before validating.
 // Returning an error surfaces the validator's message next to the control.
-// The callable is registered by the plugin that owns the type and must remain
-// valid for the host's lifetime (plugins are loaded once, never unloaded).
-using value_parse_fn = std::function<auto(std::string_view text)->std::expected<any_value, std::string>>;
+using value_parse_fn = std::function<auto(std::string_view text, std::string_view pipeline_dir)->std::expected<any_value, std::string>>;
 
-// Descriptor of a pin value type. Registered by plugins at load time.
-//
-// Naming convention: `name` is the canonical PascalCase name ("String"),
-// globally unique in the registry; `short_name` is the compact pin annotation
-// ("str") shown next to pin labels on the canvas (`name:short`). Short names
-// are a display convention — uniqueness is recommended, not enforced; a
-// collision is disambiguated by the tooltip showing the full name.
+// Descriptor of a pin value type (a "connection type" of the DSL).
+// Registered by PIPELINE plugins at load time — pure vocabulary: the name,
+// the short pin annotation and a description. No editor concerns live here:
+// inline editors are a HOST/workbench-layer extension registered separately
+// via type_registry::register_inline_editor(), keyed by the type name. This
+// keeps "which types exist" (pipeline side) decoupled from "how to edit
+// them" (editor side) — every pin of a given type behaves identically on
+// every node.
 struct value_type_desc
 {
-    std::string_view name;
-    std::string_view short_name;
+    std::string_view name;       // canonical PascalCase name, globally unique
+    std::string_view short_name; // compact pin annotation ("str")
     std::string_view description;
-
-    // When set, unconnected input pins of this type are editable in place in
-    // the node body: the host renders the control matching the kind, stores
-    // the raw text in the node's slot_values() map, and the runner parses it
-    // via `parse` and injects the result as a regular input value. Opaque
-    // types (File, Ast, Module) leave this unset — they only originate from
-    // nodes.
-    std::optional<property_kind> inline_control;
-    value_parse_fn               parse; // required when inline_control is set
 };
 
 // Type registry: maps pin-type names to runtime descriptors. Populated at
 // plugin load time as each plugin registers the value types it introduces.
-// The host queries it to render the canvas (names, colours, pin annotations),
-// to validate wires, and to parse inline-edited pin values.
+// The host queries it to render the canvas (names, colours, pin annotations)
+// and — through the host-registered inline editors — to parse inline-edited
+// pin values.
 class CC_CORE_API type_registry
 {
   public:
@@ -55,20 +48,25 @@ class CC_CORE_API type_registry
 
     // Register a concrete value type T under its canonical name.
     // Idempotent: re-registering the same (name, T) pair with an identical
-    // descriptor is a no-op; a mismatched name↔T or conflicting descriptor
-    // fields is a hard error (returns false → plugin misbehaviour, surfaced
-    // by the loader).
+    // descriptor is a no-op; a mismatched name↔T or conflicting short name
+    // is a hard error (returns false → plugin misbehaviour, surfaced by the
+    // loader).
     template<typename T>
         requires std::is_copy_constructible_v<std::remove_cvref_t<T>>
     auto
     register_value_type(value_type_desc d) -> bool
     {
-        if (d.inline_control.has_value() && !d.parse)
-        {
-            return false; // inline-editable type must provide a parser
-        }
         return register_value_type_impl(std::move(d), descriptor_of<T>);
     }
+
+    // Register an inline editor for every pin of the named connection type,
+    // regardless of which node owns the pin. Host/workbench-layer extension
+    // point (pipeline plugins do not call this): the editor pack decides how
+    // values of each type are typed in by hand. First registration wins;
+    // re-registering the same (name, control) pair is a no-op, a conflicting
+    // one fails. May be called before or after the type itself is
+    // registered (lookup resolves through the canonical name).
+    virtual auto register_inline_editor(std::string_view type_name, property_kind control, value_parse_fn parse) -> bool = 0;
 
     // Lookup by descriptor → canonical name, or empty string_view if unknown.
     virtual auto name_of(type_descriptor_t d) const -> std::string_view = 0;
@@ -83,13 +81,13 @@ class CC_CORE_API type_registry
     // True for exact match, true if `in` is the wildcard Any, false otherwise.
     virtual auto is_connectable(type_descriptor_t out, type_descriptor_t in) const -> bool = 0;
 
-    // Inline editor for values of this type, or nullopt if the type is not
-    // inline-editable.
+    // Inline editor kind for values of this type, or nullopt if the type is
+    // not inline-editable (no editor registered / unknown type).
     virtual auto inline_editor_of(type_descriptor_t d) const -> std::optional<property_kind> = 0;
 
     // Parse inline-edited text into a typed value. Fails if the type has no
     // inline editor, the validator rejects the text, or the type is unknown.
-    virtual auto parse_value(type_descriptor_t d, std::string_view text) const
+    virtual auto parse_value(type_descriptor_t d, std::string_view text, std::string_view pipeline_dir) const
             -> std::expected<any_value, std::string> = 0;
 
   protected:

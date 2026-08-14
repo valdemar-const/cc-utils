@@ -23,6 +23,7 @@ util::BlueprintNodeBuilder::BlueprintNodeBuilder(ImTextureID texture, int textur
     , CurrentNodeId(0)
     , CurrentStage(Stage::Invalid)
     , HasHeader(false)
+    , PinDetached(false)
 {
 }
 
@@ -138,7 +139,22 @@ util::BlueprintNodeBuilder::EndInput()
 {
     ImGui::EndHorizontal();
 
+    if (!PinDetached)
+    {
+        EndPin();
+    }
+    PinDetached = false;
+}
+
+void
+util::BlueprintNodeBuilder::DetachPin()
+{
+    if (CurrentStage != Stage::Input || PinDetached)
+    {
+        return;
+    }
     EndPin();
+    PinDetached = true;
 }
 
 void

@@ -9,6 +9,7 @@
 
 #include "cc/graph.hpp"
 #include "cc/host_registry.hpp"
+#include "cc/inline_editors.hpp"
 #include "cc/node.hpp"
 #include "cc/node_factory.hpp"
 #include "cc/plugin_loader.hpp"
@@ -38,6 +39,7 @@ class pipeline_xml_fixture : public ::testing::Test {
     const std::size_t loaded = loader_.load_all(*host_);
     ASSERT_GE(loaded, 4u) << "expected basic/tl/tl-ir/x86_64 plugins; got "
                           << loaded;
+    cc::runtime::register_inline_editors(*host_);
   }
 
   // Add a node of the given type and capture its instance_id.
@@ -321,7 +323,8 @@ TEST_F(pipeline_xml_fixture, save_clear_load_run_produces_42) {
   auto asm_id      = add_node(g, "x86_64.assemble");
   auto exec_id     = add_node(g, "basic.exec");
 
-  g.find_node(path_id)->properties().set("value", input_tl.string());
+  // Blender-style constant: the unconnected `in` pin carries an inline value.
+  g.find_node(path_id)->slot_values().set("in", input_tl.string());
 
   auto exe_path = std::filesystem::temp_directory_path()
                 / "cc_pipeline_xml_e2e_return42";
@@ -389,7 +392,7 @@ TEST_F(pipeline_xml_fixture, save_clear_load_run_produces_42) {
 TEST_F(pipeline_xml_fixture, save_preserves_relative_path_verbatim) {
   cc::runtime::graph g;
   std::string id = add_node(g, "filesystem.path");
-  g.find_node(id)->properties().set("value", "./input.txt");
+  g.find_node(id)->slot_values().set("in", "./input.txt");
 
   auto tmp = std::filesystem::temp_directory_path() / "cc_xml_verbatim_rel.pipeline";
   cw::pipeline_domains dom;
@@ -400,14 +403,14 @@ TEST_F(pipeline_xml_fixture, save_preserves_relative_path_verbatim) {
   ASSERT_TRUE(is.good());
   std::string xml((std::istreambuf_iterator<char>(is)),
                    std::istreambuf_iterator<char>());
-  EXPECT_NE(xml.find(">./input.txt</property>"), std::string::npos)
-      << "expected stored path verbatim; XML was:\n" << xml;
+  EXPECT_NE(xml.find(">./input.txt</value>"), std::string::npos)
+      << "expected stored inline value verbatim; XML was:\n" << xml;
 
   cc::runtime::graph g2;
   auto load = cw::load_pipeline(*host_, g2, tmp.string());
   ASSERT_TRUE(load.has_value()) << load.error();
   ASSERT_EQ(g2.nodes().size(), 1u);
-  EXPECT_EQ(std::string{g2.nodes()[0]->properties().get("value")}, "./input.txt");
+  EXPECT_EQ(std::string{g2.nodes()[0]->slot_values().get("in")}, "./input.txt");
 }
 
 // ----- relocatable payoff: the same file works from two directories --------
@@ -425,12 +428,12 @@ TEST_F(pipeline_xml_fixture, runner_resolves_relative_path_via_pipeline_dir) {
   write_file(src_input.string(), "from_src");
   write_file(dst_input.string(), "from_dst");
 
-  // filesystem.path → get_file → read_text; the path property is relative.
+  // filesystem.path → get_file → read_text; the path inline value is relative.
   cc::runtime::graph g;
   std::string path_id = add_node(g, "filesystem.path");
   std::string get_id  = add_node(g, "filesystem.get_file");
   std::string read_id = add_node(g, "filesystem.read_text");
-  g.find_node(path_id)->properties().set("value", "./source.txt");
+  g.find_node(path_id)->slot_values().set("in", "./source.txt");
   g.add_edge({path_id, "path", get_id, "path"});
   g.add_edge({get_id, "file", read_id, "file"});
 
@@ -448,9 +451,12 @@ TEST_F(pipeline_xml_fixture, runner_resolves_relative_path_via_pipeline_dir) {
   auto load = cw::load_pipeline(*host_, g2, dst_pipeline.string());
   ASSERT_TRUE(load.has_value()) << load.error();
   ASSERT_EQ(g2.nodes().size(), 3u);
-  EXPECT_EQ(std::string{g2.nodes()[0]->properties().get("value")},
-            "./source.txt")
-      << "round-trip must preserve the relative text the user typed";
+  for (auto const& n : g2.nodes()) {
+    if (n->type_id() == std::string_view{"filesystem.path"}) {
+      EXPECT_EQ(std::string{n->slot_values().get("in")}, "./source.txt")
+          << "round-trip must preserve the relative text the user typed";
+    }
+  }
 
   std::string loaded_read_id;
   for (auto const& n : g2.nodes()) {

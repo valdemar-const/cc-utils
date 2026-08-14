@@ -163,16 +163,16 @@ namespace
     }
 
     // ---------------------------------------------------------------------------
-    // filesystem.path — typed let-node for Path values.
+    // filesystem.path — typed let-node for Path values (Blender-style).
     //
-    //   in (optional) ─┐
-    //                  ├─▶ out:path   (the connected wire wins; the
-    //   property "value" ─┘            property is the fallback)
+    //   in (optional) ──▶ out:path
     //
-    // Fan-out point for reusing one path across several consumers, and the
-    // canonical constant source for pipelines that prefer explicit nodes.
-    // The input slot is named "in" (not "path") — slot ids share one
-    // namespace per node, and a colliding in/out pair would make edge
+    // The unconnected `in` pin is inline-editable (Path has an inline
+    // editor): the typed text is parsed by the runner and injected as a
+    // regular input; a connected wire overrides it. Fan-out point for
+    // reusing one path across several consumers. The input slot is named
+    // "in" (not "path") — slot ids share one namespace per node, and a
+    // colliding in/out pair would make edge
     // resolution ambiguous.
     // ---------------------------------------------------------------------------
     class path_node final : public node
@@ -225,22 +225,13 @@ namespace
         auto
         activate(std::span<const input_pair> inputs, std::span<output_pair> outputs, const activate_context & /*ctx*/) -> activate_result override
         {
-            std::filesystem::path value;
-            if (const auto *wired = find_input(inputs, "in"))
+            const auto *wired = find_input(inputs, "in");
+            const auto *p     = wired ? aa::any_cast<std::filesystem::path>(wired) : nullptr;
+            if (!p || p->empty())
             {
-                if (const auto *p = aa::any_cast<std::filesystem::path>(wired))
-                {
-                    value = *p;
-                }
+                return std::unexpected(failure {"path not set (connect 'in' or type an inline value)"});
             }
-            else
-            {
-                value = std::filesystem::path {std::string {props_.get("value")}};
-            }
-            if (value.empty())
-            {
-                return std::unexpected(failure {"path not set (connect 'in' or set the 'value' property)"});
-            }
+            std::filesystem::path value = *p;
             for (auto &[slot_id, out] : outputs)
             {
                 if (slot_id == "path")
@@ -289,25 +280,16 @@ namespace
         }
 
         auto
-        property_schema() const -> std::span<const property_desc> override
-        {
-            static constexpr property_desc schema[] = {
-                    {"value", "Value (when 'in' is not connected)", property_kind::path, ""},
-            };
-            return schema;
-        }
-
-        auto
         create() const -> std::unique_ptr<node> override
         {
-            return apply_defaults(std::make_unique<path_node>());
+            return std::make_unique<path_node>();
         }
 
         auto
         create_with_id(std::string_view instance_id) const
                 -> std::unique_ptr<node> override
         {
-            return apply_defaults(std::make_unique<path_node>(std::string {instance_id}));
+            return std::make_unique<path_node>(std::string {instance_id});
         }
     };
 
@@ -1256,80 +1238,6 @@ namespace
         }
     };
 
-    // ---------------------------------------------------------------------------
-    // Inline editors + validators for primitive types.
-    // ---------------------------------------------------------------------------
-    auto
-    parse_string(std::string_view text) -> std::expected<any_value, std::string>
-    {
-        any_value v {};
-        v = std::string {text};
-        return v;
-    }
-
-    auto
-    parse_integer(std::string_view text) -> std::expected<any_value, std::string>
-    {
-        std::string s {text};
-        char       *end = nullptr;
-        const long  n   = std::strtoll(s.c_str(), &end, 10);
-        if (end == s.c_str() || *end != '\0')
-        {
-            return std::unexpected("'" + s + "' is not an integer");
-        }
-        any_value v {};
-        v = n;
-        return v;
-    }
-
-    auto
-    parse_double(std::string_view text) -> std::expected<any_value, std::string>
-    {
-        std::string  s {text};
-        char        *end = nullptr;
-        const double d   = std::strtod(s.c_str(), &end);
-        if (end == s.c_str() || *end != '\0')
-        {
-            return std::unexpected("'" + s + "' is not a number");
-        }
-        any_value v {};
-        v = d;
-        return v;
-    }
-
-    auto
-    parse_boolean(std::string_view text) -> std::expected<any_value, std::string>
-    {
-        bool b = false;
-        if (text == "true" || text == "1")
-        {
-            b = true;
-        }
-        else if (text == "false" || text == "0")
-        {
-            b = false;
-        }
-        else
-        {
-            return std::unexpected("'" + std::string {text} + "' is not a boolean (true/false)");
-        }
-        any_value v {};
-        v = b;
-        return v;
-    }
-
-    auto
-    parse_path(std::string_view text) -> std::expected<any_value, std::string>
-    {
-        if (text.empty())
-        {
-            return std::unexpected("path must not be empty");
-        }
-        any_value v {};
-        v = std::filesystem::path {text};
-        return v;
-    }
-
     // RAII domain attribution scope (mirrors the loader's provider guard).
     struct domain_scope
     {
@@ -1367,22 +1275,24 @@ cc_plugin_register(cc::host_registry &r)
     r.register_domain({.id = "basic/view", .display_name = "View", .description = "Debug taps for any value", .depends_on = {"basic/types"}, .provided_types = {}});
     r.register_domain({.id = "system/process", .display_name = "Process", .description = "Subprocess execution", .depends_on = {"filesystem", "basic/types"}, .provided_types = {}});
 
-    // ---- value types, attributed to their domains ----
+    // ---- value types: pure vocabulary. Inline editors are a host-layer
+    // extension registered per connection type (see
+    // cc::runtime::register_inline_editors) — not a pipeline-plugin concern.
     {
         domain_scope ds {r};
         r.push_domain("basic/types");
-        r.types().register_value_type<std::string>({.name = "String", .short_name = "str", .description = "UTF-8 text", .inline_control = cc::property_kind::text, .parse = parse_string});
-        r.types().register_value_type<long>({.name = "Integer", .short_name = "int", .description = "64-bit signed integer", .inline_control = cc::property_kind::integer, .parse = parse_integer});
-        r.types().register_value_type<double>({.name = "Double", .short_name = "double", .description = "64-bit floating point", .inline_control = cc::property_kind::text, .parse = parse_double});
-        r.types().register_value_type<bool>({.name = "Boolean", .short_name = "bool", .description = "true / false", .inline_control = cc::property_kind::boolean, .parse = parse_boolean});
-        r.types().register_value_type<std::monostate>({.name = "Any", .short_name = "any", .description = "Wildcard — accepts any value", .inline_control = {}, .parse = {}});
+        r.types().register_value_type<std::string>({.name = "String", .short_name = "str", .description = "UTF-8 text"});
+        r.types().register_value_type<long>({.name = "Integer", .short_name = "int", .description = "64-bit signed integer"});
+        r.types().register_value_type<double>({.name = "Double", .short_name = "double", .description = "64-bit floating point"});
+        r.types().register_value_type<bool>({.name = "Boolean", .short_name = "bool", .description = "true / false"});
+        r.types().register_value_type<std::monostate>({.name = "Any", .short_name = "any", .description = "Wildcard — accepts any value"});
     }
     {
         domain_scope ds {r};
         r.push_domain("filesystem");
-        r.types().register_value_type<std::filesystem::path>({.name = "Path", .short_name = "path", .description = "Filesystem path (naming invariants only)", .inline_control = cc::property_kind::path, .parse = parse_path});
-        r.types().register_value_type<cc::fs::file_handle>({.name = "File", .short_name = "file", .description = "Materialised file handle with a metadata snapshot", .inline_control = {}, .parse = {}});
-        r.types().register_value_type<cc::fs::file_attrs>({.name = "FileAttrs", .short_name = "attrs", .description = "File metadata snapshot: size, permissions, modified", .inline_control = {}, .parse = {}});
+        r.types().register_value_type<std::filesystem::path>({.name = "Path", .short_name = "path", .description = "Filesystem path (naming invariants only)"});
+        r.types().register_value_type<cc::fs::file_handle>({.name = "File", .short_name = "file", .description = "Materialised file handle with a metadata snapshot"});
+        r.types().register_value_type<cc::fs::file_attrs>({.name = "FileAttrs", .short_name = "attrs", .description = "File metadata snapshot: size, permissions, modified"});
     }
 
     // ---- node factories ----

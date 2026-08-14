@@ -70,6 +70,17 @@ class type_registry_impl final : public type_registry
     }
 
     auto
+    register_inline_editor(std::string_view type_name, property_kind control, value_parse_fn parse) -> bool override
+    {
+        if (!parse)
+        {
+            return false; // an editor must provide a parser
+        }
+        auto [it, inserted] = editors_by_name_.try_emplace(std::string {type_name}, control, std::move(parse));
+        return inserted || (it->second.control == control);
+    }
+
+    auto
     inline_editor_of(type_descriptor_t d) const -> std::optional<property_kind> override
     {
         auto name = name_of(d);
@@ -77,12 +88,12 @@ class type_registry_impl final : public type_registry
         {
             return std::nullopt;
         }
-        auto it = ext_by_name_.find(std::string {name});
-        return it == ext_by_name_.end() ? std::nullopt : it->second.inline_control;
+        auto it = editors_by_name_.find(std::string {name});
+        return it == editors_by_name_.end() ? std::nullopt : std::optional<property_kind> {it->second.control};
     }
 
     auto
-    parse_value(type_descriptor_t d, std::string_view text) const
+    parse_value(type_descriptor_t d, std::string_view text, std::string_view pipeline_dir) const
             -> std::expected<any_value, std::string> override
     {
         auto name = name_of(d);
@@ -90,12 +101,12 @@ class type_registry_impl final : public type_registry
         {
             return std::unexpected("unknown value type");
         }
-        auto it = ext_by_name_.find(std::string {name});
-        if (it == ext_by_name_.end() || !it->second.parse)
+        auto it = editors_by_name_.find(std::string {name});
+        if (it == editors_by_name_.end())
         {
             return std::unexpected("type '" + std::string {name} + "' has no inline editor");
         }
-        return it->second.parse(text);
+        return it->second.parse(text, pipeline_dir);
     }
 
     auto
@@ -118,19 +129,12 @@ class type_registry_impl final : public type_registry
             {
                 return false; // name already bound to a different type
             }
-        }
-        // Extension fields (short name, inline editor, parser): first
-        // registration wins; a conflicting re-registration is an error.
-        auto [it_e, inserted_e] = ext_by_name_.try_emplace(std::string {d.name});
-        if (inserted_e)
-        {
-            it_e->second.short_name     = std::string {d.short_name};
-            it_e->second.inline_control = d.inline_control;
-            it_e->second.parse          = std::move(d.parse);
-        }
-        else if (it_e->second.short_name != d.short_name || it_e->second.inline_control != d.inline_control)
-        {
-            return false; // same type, conflicting descriptor
+            // Idempotent re-registration: short name must not conflict.
+            auto sit = desc_to_short_.find(t);
+            if (sit != desc_to_short_.end() && sit->second != d.short_name)
+            {
+                return false;
+            }
         }
         desc_to_name_[t]  = std::string {d.name};
         desc_to_short_[t] = std::string {d.short_name};
@@ -143,17 +147,16 @@ class type_registry_impl final : public type_registry
 
   private:
 
-    struct type_ext
+    struct inline_editor
     {
-        std::string                  short_name;
-        std::optional<property_kind> inline_control;
-        value_parse_fn               parse;
+        property_kind  control;
+        value_parse_fn parse;
     };
 
     std::unordered_map<std::string, type_descriptor_t> name_to_desc_;
     std::unordered_map<type_descriptor_t, std::string> desc_to_name_;
     std::unordered_map<type_descriptor_t, std::string> desc_to_short_;
-    std::unordered_map<std::string, type_ext>          ext_by_name_;
+    std::unordered_map<std::string, inline_editor>     editors_by_name_;
     std::optional<type_descriptor_t>                   any_descriptor_;
     std::function<void(std::string_view)>              hook_;
 };

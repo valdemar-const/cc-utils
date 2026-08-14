@@ -290,7 +290,7 @@ cc_plugin_register(cc::host_registry &r)
     r.register_domain({.id = "compiler/lang/tl", .display_name = "TL Language", .description = "tl frontend passes: parsing and AST", .depends_on = {"basic/types", "filesystem", "basic/view"}, .provided_types = {}});
 
     r.push_domain("compiler/lang/tl");
-    r.types().register_value_type<cc::basic::tl::ast_value>({.name = "Ast", .short_name = "ast", .description = "tl syntax tree (shared_ptr<tl_program>)", .inline_control = {}, .parse = {}});
+    r.types().register_value_type<cc::basic::tl::ast_value>({.name = "Ast", .short_name = "ast", .description = "tl syntax tree (shared_ptr<tl_program>)"});
     r.pop_domain();
     r.register_node_factory(std::make_unique<cc::basic::tl::frontend_factory>());
 }

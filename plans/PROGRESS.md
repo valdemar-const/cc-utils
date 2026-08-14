@@ -241,3 +241,35 @@ Help
 - **Прочее**: `gtest-1.18.0.zip` добавлен в CPM preload (`cpm add`),
   `cpm requires bump GTest` — уже 1.18.0; ассет `test.tl.pipeline`
   мигрирован на v2
+
+### In-pin редакторы (Blender-forms) ✅
+
+- `BlueprintNodeBuilder::DetachPin()` — обрезает зону хит-теста пина до
+  иконка+имя; виджеты после него интерактивны, но не являются
+  drag-источником провода
+- `draw_inline_pin_widget` — compact-редактор В СТРОКЕ пина (F2/F3):
+  InputTextWithHint с placeholder `:short`, integer-фильтр, checkbox,
+  path + "..." Browse (файловый диалог получил slot_mode); multiline в
+  строке пина деградирует до single-line
+- Футер — только properties; inline-редакторы из футера удалены
+- `filesystem.path`: property-fallback удалён, константа = inline-значение
+  пина `in` (Blender-семантика; тесты и ассет переведены на `<values>`)
+- Формы пинов (закрытое множество F1–F6) — см. `plans/domains.md` §4b
+
+### Редакторы как расширение хоста ✅
+
+- `value_type_desc` — чистый словарь (name/short/description), редакторов
+  в нём нет; новый entry point
+  `type_registry::register_inline_editor(type_name, control, parse)` —
+  редактор по имени ТИПА СОЕДИНЕНИЯ, одинаково для всех узлов/вендоров
+- Дефолтный пакет хоста `cc::runtime::register_inline_editors`
+  (`cc/inline_editors.hpp`): String/Integer/Double/Boolean/Path/File;
+  File-редактор: текст → resolve против pipeline_dir → stat →
+  `cc::fs::file_handle` (None-случай = ошибка валидатора). Парсеры
+  получают `pipeline_dir` вторым аргументом (`value_parse_fn`)
+- `:file`-входы (exec) получили inline-редактор — консистентность по типу
+- Фиксированная ширина слота редактирования (`inline_slot_width`),
+  при проводе — инертный спейсер той же ширины: узел не дёргается
+- Pin-hover rect'ы заглушены прозрачным `StyleColor_PinRect*` (pin-канал
+  рисуется поверх контента и конфликтовал с виджетами строки пина)
+- Тесты: 47/47 (+ `file_inline_editor_materialises_handle`)

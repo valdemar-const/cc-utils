@@ -202,8 +202,17 @@ The workbench uses ImGui Bundle extensively. Key things to know:
 - **Fonts**: loaded in `LoadAdditionalFonts` callback. `HelloImGui::LoadFont()` wraps `AddFontFromMemoryTTF`. Use `mergeToLastFont=true` to merge icon/emoji fonts into the main font. `io.FontDefault` sets the global default (used for window titles, tab labels).
 - **NotoEmoji-Regular.ttf** (monochrome vector) works reliably for emoji in tab titles. NotoColorEmoji.ttf (bitmap/SVG) does NOT render via FreeType — avoid it.
 - **FontAwesome** icon headers: `icons_font_awesome_4.h` / `icons_font_awesome_6.h` in the HelloImGui source tree. Macros like `ICON_FA_EYE` map to UTF-8 byte sequences.
-- **imgui_stacklayout**: patched ImGui with `BeginHorizontal`/`EndHorizontal`, `BeginVertical`/`EndVertical`, `Spring()`. Use for toolbars and aligned layouts instead of manual `SameLine()`.
+- **imgui-stacklayout**: patched ImGui with `BeginHorizontal`/`EndHorizontal`, `BeginVertical`/`EndVertical`, `Spring()`. Use for toolbars and aligned layouts instead of manual `SameLine()`.
 - **imgui-node-editor**: namespace `ed` / `ax::NodeEditor`. Uses integer IDs for nodes/links/pins. Draw channels split editor content from ImGui content.
+
+### Canvas invariants (battle-tested — check BEFORE debugging)
+
+- **No top-level windows inside `ed::Begin/End`**: `SetTooltip` / `BeginPopup` there corrupt the editor's draw-channel state (gray canvas smear, shifted node content). Patterns: deferred tooltip (stash text in state, flush right after `ed::End()`); centered modal (latch flag → `OpenPopup` → `BeginPopupModal`, called from `ShowGui` like `draw_load_error_modal` / `draw_editor_chooser`). Custom transient windows (`draw_create_menu`, `draw_palette_drop`) render after `ed::End()` only.
+- **Item rects inside the suspended editor are canvas-local**, not screen coords (nodes live at e.g. x=-920). Never anchor a plain window to `GetItemRectMin()` taken inside `ed::Begin/End` — it lands off-viewport and looks "silently dead". Convert via `ed::CanvasToScreen` (see the `MouseClickedPos` note in the canvas code) or use a centered modal.
+- **Pin-row widgets are submitted in EVERY mode** (incl. `ghost` — the degenerate clip culls pixels and interaction, but `ItemSize` still measures). Never gate a row item on `!ghost`: connect/disconnect must not change row geometry (pixel-stable nodes).
+- **`SameLine()` only when the follow-up item will actually render.** A dangling `SameLine` (item skipped due to empty catalog etc.) glues the NEXT row onto the current line — the node footer is a plain vertical flow.
+- **Resource editors**: for any resource type — pin value (typed by connection type) or footer property (typed via kind→canonical-type map) — exactly one inplace editor plus N full-size editors with namespaced ids (`editors.<family>.<flavour>`). Entry point is the single `draw_resource_editor_entry()` (pencil); editor tabs all render the one node-side model (`slot_values()`/`properties()`) and sync through it. Registration is TYPE-keyed, never node-keyed.
+- **When a GUI mechanism misbehaves**: add a log line at EVERY link of the chain (request → open → self-close → action) before iterating. The absent line pinpoints the broken link in one run instead of N rebuilds.
 
 ## Dependency Cache Locations
 

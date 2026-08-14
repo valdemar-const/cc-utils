@@ -199,6 +199,12 @@ Help
 5. **Save layout restore в .pipeline**: помимо <pos> добавить zoom/viewport
 6. **Multi-document**: несколько Pipeline табов (каждый со своим графом и
    file path). Требует AppState → vector<PipelineDoc> + active-tab state
+7. **CLI + entry-point** (см. `docs/pipeline-format.md` §9): `cc-workbench
+   <file>` открывает документ при старте (тривиально); `pipeline --run
+   <file> -- args` — headless-исполнение поверх cc-runtime + pipeline_xml
+   (условный `projects/bin/cc-run`). Требует декларации entry-узла и
+   байндинга argv в формате — кандидат на v3; заодно убирает хардкод
+   `x86_64.assemble` из Run (пп. 2)
 
 ## Шаг 7 — Домены предметной области ✅ (plugin API v4, формат v2)
 

@@ -1,6 +1,8 @@
-// Unit tests for pipeline_xml: serialise a runtime::graph + canvas positions
-// to XML, parse it back, verify the round-trip preserves nodes / properties /
-// edges / positions / <requires>.
+// Unit tests for pipeline_xml (format v2): serialise a runtime::graph +
+// canvas positions + the domain contract to XML, parse it back, verify the
+// round-trip preserves nodes / properties / inline values / edges /
+// positions / <requires> / domain + imports. Also covers the legacy v1 mode
+// and the domain-contract validation rules.
 //
 // Loads the same cc-plugin-*.so plugins as the workbench so the test exercises
 // real factories with create_with_id() override.
@@ -21,6 +23,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 namespace cw = cc::workbench;
@@ -47,6 +50,13 @@ class pipeline_xml_fixture : public ::testing::Test {
     return id;
   }
 
+  auto save(cc::runtime::graph& g, const std::string& path) -> bool {
+    cw::pipeline_domains dom;
+    dom.root = "compiler/lang/tl";
+    dom.imports = {"compiler/backend/x86_64", "system/process"};
+    return cw::save_pipeline(*host_, g, {}, dom, path).has_value();
+  }
+
   // loader_ must be declared before (and so outlive) host_: host_ owns factory
   // objects whose vtables live in the plugin DLLs, freed by ~plugin_loader.
   // Members destruct in reverse declaration order.
@@ -54,8 +64,6 @@ class pipeline_xml_fixture : public ::testing::Test {
   std::unique_ptr<cc::host_registry> host_;
 };
 
-// Match the helper in pipeline_xml.cpp: parse a piece of XML in-memory to
-// validate behaviour on synthetic inputs (no disk I/O required).
 auto write_file(const std::string& path, const std::string& content) -> void {
   std::ofstream os{path, std::ios::binary | std::ios::trunc};
   os << content;
@@ -87,59 +95,66 @@ TEST_F(pipeline_xml_fixture, create_with_id_stamps_default_properties) {
 TEST_F(pipeline_xml_fixture, empty_graph_round_trip) {
   cc::runtime::graph g;
   auto tmp = std::filesystem::temp_directory_path() / "cc_xml_empty.pipeline";
-  auto save = cw::save_pipeline(*host_, g, {}, tmp.string());
-  ASSERT_TRUE(save.has_value()) << save.error();
+  ASSERT_TRUE(save(g, tmp.string()));
 
   cc::runtime::graph g2;
   auto load = cw::load_pipeline(*host_, g2, tmp.string());
   ASSERT_TRUE(load.has_value()) << load.error();
-  EXPECT_TRUE(g2.nodes().empty());
-  EXPECT_TRUE(g2.edges().empty());
-  EXPECT_TRUE(load->positions.empty());
-  EXPECT_TRUE(load->warnings.missing_plugins.empty());
-  EXPECT_TRUE(load->warnings.unknown_node_types.empty());
-  EXPECT_TRUE(load->warnings.skipped_edges.empty());
+  EXPECT_EQ(g2.nodes().size(), 0u);
+  EXPECT_EQ(g2.edges().size(), 0u);
+  EXPECT_EQ(load->domains.root, "compiler/lang/tl");
 }
 
-// ----- single node round-trips with properties + position -----------------
+// ----- node + property + inline value round-trip ---------------------------
 
-TEST_F(pipeline_xml_fixture, single_node_round_trip) {
+TEST_F(pipeline_xml_fixture, node_property_and_inline_value_round_trip) {
   cc::runtime::graph g;
   std::string id = add_node(g, "basic.text.constant");
   g.find_node(id)->properties().set("value", "return 7;");
-  // Round-trip through a different factory to verify the id is preserved.
-  ASSERT_NE(id, std::string{}) << "precondition: instance id is non-empty";
+  // Inline pin value on a get_file node (input slot "path").
+  std::string gid = add_node(g, "filesystem.get_file");
+  g.find_node(gid)->slot_values().set("path", "/tmp/somewhere.tl");
 
   std::unordered_map<std::string, cw::pos> positions{{id, {120.5f, 340.0f}}};
-  auto tmp = std::filesystem::temp_directory_path() / "cc_xml_one.pipeline";
-
-  auto save = cw::save_pipeline(*host_, g, positions, tmp.string());
-  ASSERT_TRUE(save.has_value()) << save.error();
+  cw::pipeline_domains dom;
+  dom.root = "filesystem";
+  auto tmp = std::filesystem::temp_directory_path() / "cc_xml_node.pipeline";
+  ASSERT_TRUE(cw::save_pipeline(*host_, g, positions, dom, tmp.string())
+                  .has_value());
 
   cc::runtime::graph g2;
   auto load = cw::load_pipeline(*host_, g2, tmp.string());
   ASSERT_TRUE(load.has_value()) << load.error();
-  ASSERT_EQ(g2.nodes().size(), 1u);
-  EXPECT_EQ(std::string{g2.nodes()[0]->type_id()}, "basic.text.constant");
-  EXPECT_EQ(std::string{g2.nodes()[0]->instance_id()}, id);
-  EXPECT_EQ(std::string{g2.nodes()[0]->properties().get("value")}, "return 7;");
+  ASSERT_EQ(g2.nodes().size(), 2u);
 
-  auto pit = load->positions.find(id);
-  ASSERT_NE(pit, load->positions.end());
-  EXPECT_FLOAT_EQ(pit->second.x, 120.5f);
-  EXPECT_FLOAT_EQ(pit->second.y, 340.0f);
+  for (auto const& n : g2.nodes()) {
+    if (n->type_id() == std::string_view{"basic.text.constant"}) {
+      EXPECT_EQ(std::string{n->instance_id()}, id);
+      EXPECT_EQ(std::string{n->properties().get("value")}, "return 7;");
+      auto pit = load->positions.find(id);
+      ASSERT_NE(pit, load->positions.end());
+      EXPECT_FLOAT_EQ(pit->second.x, 120.5f);
+      EXPECT_FLOAT_EQ(pit->second.y, 340.0f);
+    }
+    if (n->type_id() == std::string_view{"filesystem.get_file"}) {
+      // <values> round-trip: the inline pin text survives verbatim.
+      EXPECT_EQ(std::string{n->slot_values().get("path")}, "/tmp/somewhere.tl");
+    }
+  }
+  EXPECT_EQ(load->domains.root, "filesystem");
+  EXPECT_TRUE(load->domains.imports.empty());
 }
 
 // ----- edges survive the round-trip ---------------------------------------
 
 TEST_F(pipeline_xml_fixture, edge_round_trip) {
   cc::runtime::graph g;
-  std::string src = add_node(g, "basic.text.constant");
+  std::string src = add_node(g, "filesystem.read_text");
   std::string dst = add_node(g, "tl.frontend");
-  g.add_edge({src, "out", dst, "src"});
+  g.add_edge({src, "text", dst, "src"});
 
   auto tmp = std::filesystem::temp_directory_path() / "cc_xml_edge.pipeline";
-  ASSERT_TRUE(cw::save_pipeline(*host_, g, {}, tmp.string()).has_value());
+  ASSERT_TRUE(save(g, tmp.string()));
 
   cc::runtime::graph g2;
   auto load = cw::load_pipeline(*host_, g2, tmp.string());
@@ -147,7 +162,7 @@ TEST_F(pipeline_xml_fixture, edge_round_trip) {
   ASSERT_EQ(g2.edges().size(), 1u);
   const auto& e = g2.edges()[0];
   EXPECT_EQ(std::string{e.src_node}, src);
-  EXPECT_EQ(std::string{e.src_slot}, "out");
+  EXPECT_EQ(std::string{e.src_slot}, "text");
   EXPECT_EQ(std::string{e.dst_node}, dst);
   EXPECT_EQ(std::string{e.dst_slot}, "src");
 }
@@ -160,11 +175,8 @@ TEST_F(pipeline_xml_fixture, requires_section_lists_providers) {
   add_node(g, "tl.frontend");           // provider = tl
 
   auto tmp = std::filesystem::temp_directory_path() / "cc_xml_req.pipeline";
-  ASSERT_TRUE(cw::save_pipeline(*host_, g, {}, tmp.string()).has_value());
+  ASSERT_TRUE(save(g, tmp.string()));
 
-  // Read back the XML and inspect the <requires> block directly — we don't
-  // expose it through the load API, but it's the contract the workbench UI
-  // relies on to tell the user which plugins it needs.
   std::ifstream is{tmp};
   ASSERT_TRUE(is.good());
   std::string xml((std::istreambuf_iterator<char>(is)),
@@ -174,13 +186,64 @@ TEST_F(pipeline_xml_fixture, requires_section_lists_providers) {
   EXPECT_NE(xml.find("name=\"tl\""), std::string::npos);
 }
 
-// ----- load surfaces missing plugins as warnings (not errors) -------------
+// ----- save refuses a pipeline without a root domain -----------------------
 
-TEST_F(pipeline_xml_fixture, missing_plugin_is_warning_not_error) {
-  // Hand-craft a pipeline that requires a plugin the host never loaded. The
-  // easiest way is to claim a type_id that no factory provides: it will be
-  // skipped, and its edges also skipped — but the load should still succeed.
-  auto tmp = std::filesystem::temp_directory_path() / "cc_xml_missing.pipeline";
+TEST_F(pipeline_xml_fixture, save_without_domain_is_error) {
+  cc::runtime::graph g;
+  add_node(g, "basic.text.constant");
+  auto tmp = std::filesystem::temp_directory_path() / "cc_xml_nodom.pipeline";
+  cw::pipeline_domains dom;  // root empty
+  auto res = cw::save_pipeline(*host_, g, {}, dom, tmp.string());
+  ASSERT_FALSE(res.has_value());
+  EXPECT_NE(res.error().find("root domain"), std::string::npos);
+}
+
+// ----- domain contract: missing root is a hard error, missing import a warning
+
+TEST_F(pipeline_xml_fixture, missing_root_domain_is_hard_error) {
+  auto tmp = std::filesystem::temp_directory_path() / "cc_xml_badroot.pipeline";
+  static constexpr std::string_view kXml =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+      "<pipeline version=\"2\" domain=\"no/such/domain\">\n"
+      "  <requires/>\n"
+      "  <nodes/>\n"
+      "  <edges/>\n"
+      "</pipeline>\n";
+  write_file(tmp.string(), std::string{kXml});
+
+  cc::runtime::graph g;
+  auto load = cw::load_pipeline(*host_, g, tmp.string());
+  ASSERT_FALSE(load.has_value());
+  EXPECT_NE(load.error().find("root domain"), std::string::npos);
+}
+
+TEST_F(pipeline_xml_fixture, missing_import_is_warning) {
+  auto tmp = std::filesystem::temp_directory_path() / "cc_xml_badimp.pipeline";
+  static constexpr std::string_view kXml =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+      "<pipeline version=\"2\" domain=\"filesystem\">\n"
+      "  <imports>\n"
+      "    <domain id=\"no/such/import\"/>\n"
+      "  </imports>\n"
+      "  <requires/>\n"
+      "  <nodes/>\n"
+      "  <edges/>\n"
+      "</pipeline>\n";
+  write_file(tmp.string(), std::string{kXml});
+
+  cc::runtime::graph g;
+  auto load = cw::load_pipeline(*host_, g, tmp.string());
+  ASSERT_TRUE(load.has_value()) << load.error();
+  EXPECT_EQ(load->domains.root, "filesystem");
+  ASSERT_EQ(load->domains.imports.size(), 1u);
+  EXPECT_EQ(load->domains.imports[0], "no/such/import");
+  ASSERT_EQ(load->warnings.missing_domains.size(), 1u);
+}
+
+// ----- legacy v1: loads with an empty contract + legacy flag ---------------
+
+TEST_F(pipeline_xml_fixture, legacy_v1_loads_in_legacy_mode) {
+  auto tmp = std::filesystem::temp_directory_path() / "cc_xml_legacy.pipeline";
   static constexpr std::string_view kXml =
       "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
       "<pipeline version=\"1\">\n"
@@ -199,7 +262,8 @@ TEST_F(pipeline_xml_fixture, missing_plugin_is_warning_not_error) {
   cc::runtime::graph g;
   auto load = cw::load_pipeline(*host_, g, tmp.string());
   ASSERT_TRUE(load.has_value()) << load.error();
-  EXPECT_EQ(g.nodes().size(), 0u);
+  EXPECT_TRUE(load->legacy);
+  EXPECT_TRUE(load->domains.root.empty());
   ASSERT_EQ(load->warnings.missing_plugins.size(), 1u);
   EXPECT_EQ(load->warnings.missing_plugins[0], "ghost-plugin");
   ASSERT_EQ(load->warnings.unknown_node_types.size(), 1u);
@@ -209,7 +273,7 @@ TEST_F(pipeline_xml_fixture, missing_plugin_is_warning_not_error) {
 
 TEST_F(pipeline_xml_fixture, malformed_xml_is_error) {
   auto tmp = std::filesystem::temp_directory_path() / "cc_xml_bad.pipeline";
-  write_file(tmp.string(), "<pipeline version=\"1\"><nodes><not-closed...");
+  write_file(tmp.string(), "<pipeline version=\"2\"><nodes><not-closed...");
   cc::runtime::graph g;
   auto load = cw::load_pipeline(*host_, g, tmp.string());
   ASSERT_FALSE(load.has_value());
@@ -241,78 +305,72 @@ TEST_F(pipeline_xml_fixture, unsupported_version_is_error) {
 }
 
 // ----- end-to-end: build, save, clear, load, run = 42 ---------------------
-// This is the smoke test the user asked for: prove that a pipeline file
-// produced by Save can be Loaded back into a fresh graph and produce the
-// same exit code. It exercises every layer of the new code at once:
-//   - create_with_id preserves instance_ids so the edges resolve
-//   - <requires> + <properties> round-trip
-//   - the runner can drive the restored graph
 
 TEST_F(pipeline_xml_fixture, save_clear_load_run_produces_42) {
   cc::runtime::graph g;
 
-  auto constant_id = add_node(g, "basic.text.constant");
+  auto input_tl = std::filesystem::temp_directory_path() / "cc_xml_e2e_42.tl";
+  write_file(input_tl.string(), "return 42;");
+
+  auto path_id     = add_node(g, "filesystem.path");
+  auto get_id      = add_node(g, "filesystem.get_file");
+  auto read_id     = add_node(g, "filesystem.read_text");
   auto frontend_id = add_node(g, "tl.frontend");
   auto irgen_id    = add_node(g, "tl.irgen");
   auto nasm_id     = add_node(g, "x86_64.nasm_gen");
   auto asm_id      = add_node(g, "x86_64.assemble");
   auto exec_id     = add_node(g, "basic.exec");
 
-  g.find_node(constant_id)->properties().set("value", "return 42;");
+  g.find_node(path_id)->properties().set("value", input_tl.string());
+
   auto exe_path = std::filesystem::temp_directory_path()
                 / "cc_pipeline_xml_e2e_return42";
   std::error_code rm;
   std::filesystem::remove(exe_path, rm);
   g.find_node(asm_id)->properties().set("out_path", exe_path.string());
 
-  g.add_edge({constant_id, "out", frontend_id, "src"});
-  g.add_edge({frontend_id, "ast", irgen_id,    "ast"});
-  g.add_edge({irgen_id,    "ir",  nasm_id,     "ir"});
-  g.add_edge({nasm_id,     "asm", asm_id,      "asm"});
-  g.add_edge({asm_id,      "exe", exec_id,     "exe"});
+  g.add_edge({path_id,     "path", get_id,      "path"});
+  g.add_edge({get_id,      "file", read_id,     "file"});
+  g.add_edge({read_id,     "text", frontend_id, "src"});
+  g.add_edge({frontend_id, "ast",  irgen_id,    "ast"});
+  g.add_edge({irgen_id,    "ir",   nasm_id,     "ir"});
+  g.add_edge({nasm_id,     "asm",  asm_id,      "asm"});
+  g.add_edge({asm_id,      "file", exec_id,     "file"});
 
-  // Save with some fake positions to also exercise the pos round-trip.
   std::unordered_map<std::string, cw::pos> positions{
-      {constant_id, {100, 100}},
-      {frontend_id, {300, 100}},
-      {irgen_id,    {500, 100}},
-      {nasm_id,     {700, 100}},
-      {asm_id,      {900, 100}},
-      {exec_id,     {1100, 100}},
+      {path_id, {0, 100}},   {get_id, {200, 100}},
+      {read_id, {400, 100}}, {frontend_id, {600, 100}},
+      {irgen_id, {800, 100}}, {nasm_id, {1000, 100}},
+      {asm_id, {1200, 100}},  {exec_id, {1400, 100}},
   };
+  cw::pipeline_domains dom;
+  dom.root = "compiler/lang/tl";
+  dom.imports = {"compiler/backend/x86_64", "system/process"};
   auto tmp = std::filesystem::temp_directory_path() / "cc_pipeline_xml_e2e.pipeline";
-  ASSERT_TRUE(cw::save_pipeline(*host_, g, positions, tmp.string()).has_value());
+  ASSERT_TRUE(cw::save_pipeline(*host_, g, positions, dom, tmp.string())
+                  .has_value());
 
-  // Drop the in-memory graph and load it back from disk — simulates File →
-  // Open after File → Save in the workbench, including a fresh process.
   cc::runtime::graph g2;
   auto load = cw::load_pipeline(*host_, g2, tmp.string());
   ASSERT_TRUE(load.has_value()) << load.error();
-  ASSERT_EQ(g2.nodes().size(), 6u) << "expected every node to round-trip";
-  ASSERT_EQ(g2.edges().size(), 5u) << "expected every edge to round-trip";
-  ASSERT_EQ(load->positions.size(), 6u)
-      << "expected every position to round-trip";
+  ASSERT_EQ(g2.nodes().size(), 8u) << "expected every node to round-trip";
+  ASSERT_EQ(g2.edges().size(), 7u) << "expected every edge to round-trip";
+  ASSERT_EQ(load->positions.size(), 8u);
+  EXPECT_EQ(load->domains.root, "compiler/lang/tl");
   EXPECT_TRUE(load->warnings.missing_plugins.empty());
   EXPECT_TRUE(load->warnings.unknown_node_types.empty());
   EXPECT_TRUE(load->warnings.skipped_edges.empty());
 
-  // The assemble node's `out_path` must survive the round-trip — otherwise
-  // the runner below would fail when the node tries to write the ELF binary.
-  std::string restored_asm_id;
   std::string restored_exec_id;
   for (auto const& n : g2.nodes()) {
-    if (n->type_id() == std::string_view{"x86_64.assemble"}) {
-      restored_asm_id = n->instance_id();
-      EXPECT_EQ(std::string{n->properties().get("out_path")}, exe_path.string());
-    }
     if (n->type_id() == std::string_view{"basic.exec"}) {
       restored_exec_id = n->instance_id();
     }
   }
-  ASSERT_FALSE(restored_asm_id.empty());
   ASSERT_FALSE(restored_exec_id.empty());
 
-  cc::runtime::runner r{g2};
+  cc::runtime::runner r{g2, {}, std::filesystem::temp_directory_path().string(),
+                        &host_->types()};
   auto result = r.pull(restored_exec_id, "ret_code");
   ASSERT_TRUE(result.has_value()) << "pull failed: " << result.error().what;
   const cc::any_value* v = *result;
@@ -322,25 +380,22 @@ TEST_F(pipeline_xml_fixture, save_clear_load_run_produces_42) {
   ASSERT_NE(code, nullptr);
   EXPECT_EQ(*code, 42);
 
-  // Clean up the artifacts.
   std::filesystem::remove(tmp, rm);
   std::filesystem::remove(exe_path, rm);
 }
 
-// ----- round-trip is verbatim: relative stays relative, absolute stays absolute -----
+// ----- round-trip is verbatim: relative stays relative ---------------------
 
 TEST_F(pipeline_xml_fixture, save_preserves_relative_path_verbatim) {
   cc::runtime::graph g;
-  std::string id = add_node(g, "basic.text.from_file");
-  // A user-typed relative path: must stay exactly this string through save
-  // and load — resolution against the pipeline's directory is activate()'s
-  // job, not the storage layer's.
-  g.find_node(id)->properties().set("path", "./input.txt");
+  std::string id = add_node(g, "filesystem.path");
+  g.find_node(id)->properties().set("value", "./input.txt");
 
   auto tmp = std::filesystem::temp_directory_path() / "cc_xml_verbatim_rel.pipeline";
-  ASSERT_TRUE(cw::save_pipeline(*host_, g, {}, tmp.string()).has_value());
+  cw::pipeline_domains dom;
+  dom.root = "filesystem";
+  ASSERT_TRUE(cw::save_pipeline(*host_, g, {}, dom, tmp.string()).has_value());
 
-  // On-disk form: the relative path is written verbatim.
   std::ifstream is{tmp};
   ASSERT_TRUE(is.good());
   std::string xml((std::istreambuf_iterator<char>(is)),
@@ -348,41 +403,14 @@ TEST_F(pipeline_xml_fixture, save_preserves_relative_path_verbatim) {
   EXPECT_NE(xml.find(">./input.txt</property>"), std::string::npos)
       << "expected stored path verbatim; XML was:\n" << xml;
 
-  // Round-trip through load: the in-memory property string is identical to
-  // what the user typed. No expansion, no canonicalisation.
   cc::runtime::graph g2;
   auto load = cw::load_pipeline(*host_, g2, tmp.string());
   ASSERT_TRUE(load.has_value()) << load.error();
   ASSERT_EQ(g2.nodes().size(), 1u);
-  EXPECT_EQ(std::string{g2.nodes()[0]->properties().get("path")}, "./input.txt");
+  EXPECT_EQ(std::string{g2.nodes()[0]->properties().get("value")}, "./input.txt");
 }
 
-TEST_F(pipeline_xml_fixture, save_preserves_absolute_path_verbatim) {
-  cc::runtime::graph g;
-  std::string id = add_node(g, "basic.text.from_file");
-  std::string abs_path =
-      (std::filesystem::temp_directory_path() / "cc_xml_abs_input.txt").string();
-  g.find_node(id)->properties().set("path", abs_path);
-
-  auto tmp = std::filesystem::temp_directory_path() / "cc_xml_verbatim_abs.pipeline";
-  ASSERT_TRUE(cw::save_pipeline(*host_, g, {}, tmp.string()).has_value());
-
-  cc::runtime::graph g2;
-  auto load = cw::load_pipeline(*host_, g2, tmp.string());
-  ASSERT_TRUE(load.has_value()) << load.error();
-  ASSERT_EQ(g2.nodes().size(), 1u);
-  EXPECT_EQ(std::string{g2.nodes()[0]->properties().get("path")}, abs_path)
-      << "absolute path must round-trip unchanged";
-}
-
-// ----- relocatable payoff: the same file works from two different directories -----
-//
-// The .pipeline file stores `./source.txt`. We copy file + input into a
-// second directory, load from there, and ask the runner to activate. The
-// node resolves `./source.txt` against the *destination* pipeline_dir
-// (forwarded via runner constructor), reading the destination's copy. This
-// is the "no surprise" UX: the property text stays what the user typed, and
-// the right thing happens at runtime.
+// ----- relocatable payoff: the same file works from two directories --------
 
 TEST_F(pipeline_xml_fixture, runner_resolves_relative_path_via_pipeline_dir) {
   auto root = std::filesystem::temp_directory_path() / "cc_xml_runner_resolve";
@@ -392,41 +420,47 @@ TEST_F(pipeline_xml_fixture, runner_resolves_relative_path_via_pipeline_dir) {
   std::filesystem::create_directories(src_dir);
   std::filesystem::create_directories(dst_dir);
 
-  // Place a different content in each directory's source.txt — that way we
-  // can tell which one the runner actually read.
   auto src_input = src_dir / "source.txt";
   auto dst_input = dst_dir / "source.txt";
   write_file(src_input.string(), "from_src");
   write_file(dst_input.string(), "from_dst");
 
+  // filesystem.path → get_file → read_text; the path property is relative.
   cc::runtime::graph g;
-  std::string id = add_node(g, "basic.text.from_file");
-  g.find_node(id)->properties().set("path", "./source.txt");  // relative — user's choice
+  std::string path_id = add_node(g, "filesystem.path");
+  std::string get_id  = add_node(g, "filesystem.get_file");
+  std::string read_id = add_node(g, "filesystem.read_text");
+  g.find_node(path_id)->properties().set("value", "./source.txt");
+  g.add_edge({path_id, "path", get_id, "path"});
+  g.add_edge({get_id, "file", read_id, "file"});
 
   auto src_pipeline = src_dir / "graph.pipeline";
-  ASSERT_TRUE(cw::save_pipeline(*host_, g, {}, src_pipeline.string()).has_value());
+  cw::pipeline_domains dom;
+  dom.root = "filesystem";
+  ASSERT_TRUE(cw::save_pipeline(*host_, g, {}, dom, src_pipeline.string())
+                  .has_value());
 
-  // Copy into dst. The .pipeline file is byte-identical (so the property text
-  // is still "./source.txt" — round-trip preserves it), and source.txt comes
-  // along for the ride.
   std::filesystem::copy_file(src_pipeline, dst_dir / "graph.pipeline",
                               std::filesystem::copy_options::overwrite_existing);
 
-  // Load from dst_dir — the in-memory property is still "./source.txt".
   cc::runtime::graph g2;
   auto dst_pipeline = dst_dir / "graph.pipeline";
   auto load = cw::load_pipeline(*host_, g2, dst_pipeline.string());
   ASSERT_TRUE(load.has_value()) << load.error();
-  ASSERT_EQ(g2.nodes().size(), 1u);
-  EXPECT_EQ(std::string{g2.nodes()[0]->properties().get("path")}, "./source.txt")
+  ASSERT_EQ(g2.nodes().size(), 3u);
+  EXPECT_EQ(std::string{g2.nodes()[0]->properties().get("value")},
+            "./source.txt")
       << "round-trip must preserve the relative text the user typed";
 
-  // Now pull. The runner constructed with pipeline_dir = dst_dir resolves
-  // "./source.txt" against dst_dir, so the node reads dst_dir/source.txt and
-  // emits "from_dst" — NOT src_dir/source.txt.
-  std::string loaded_id{g2.nodes()[0]->instance_id()};
-  cc::runtime::runner r{g2, {}, dst_dir.string()};
-  auto result = r.pull(loaded_id, "out");
+  std::string loaded_read_id;
+  for (auto const& n : g2.nodes()) {
+    if (n->type_id() == std::string_view{"filesystem.read_text"})
+      loaded_read_id = n->instance_id();
+  }
+  ASSERT_FALSE(loaded_read_id.empty());
+
+  cc::runtime::runner r{g2, {}, dst_dir.string(), &host_->types()};
+  auto result = r.pull(loaded_read_id, "text");
   ASSERT_TRUE(result.has_value()) << result.error().what;
   const cc::any_value* v = *result;
   ASSERT_NE(v, nullptr);

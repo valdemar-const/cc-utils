@@ -7,9 +7,9 @@
 #include "executor.hpp"
 
 #if defined(_WIN32)
-#  include "executor_win32.txx"
+#include "executor_win32.txx"
 #elif defined(__unix__) || defined(__APPLE__)
-#  include "executor_posix.txx"
+#include "executor_posix.txx"
 #else
-#  error "cc::basic::executor: unsupported platform"
+#error "cc::basic::executor: unsupported platform"
 #endif

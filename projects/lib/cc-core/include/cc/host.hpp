@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cc-core_export.hpp"
+#include "cc/domain.hpp"
 #include "cc/registry.hpp"
 #include "cc/view.hpp"
 
@@ -8,6 +9,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace cc
 {
@@ -16,6 +18,7 @@ class node_factory; // see cc/node_factory.hpp
 
 // Host-side collection point that plugins populate at load time. Aggregates:
 //  - the type registry (pin types)
+//  - the vocabulary domain registry (see cc/domain.hpp)
 //  - the node factory catalogue (node types)
 //  - the view renderer provider (how to draw each value type)
 //
@@ -32,6 +35,22 @@ class CC_CORE_API host_registry
     // ---- type registry ----
     virtual auto types() -> type_registry &             = 0;
     virtual auto types() const -> const type_registry & = 0;
+
+    // ---- vocabulary domains -----------------------------------------------
+    // Open-world registry of domain descriptors. register_domain() merges by
+    // id: dependencies union, first non-empty display metadata wins — so any
+    // plugin may seed or extend any domain regardless of load order.
+    //
+    // push_domain()/pop_domain() set the domain any types registered in
+    // between are attributed to (mirrors push_provider/pop_provider). Used by
+    // domain-provider plugins around their register_value_type() calls;
+    // provided_types is informational (New Pipeline dialog).
+    virtual auto register_domain(domain_desc d) -> void                                                    = 0;
+    virtual auto find_domain(std::string_view id) const -> const domain_desc *                             = 0;
+    virtual auto domains() const -> std::span<const domain_desc>                                           = 0;
+    virtual auto domain_closure(std::span<const std::string_view> roots) const -> std::vector<std::string> = 0;
+    virtual auto push_domain(std::string_view id) -> void                                                  = 0;
+    virtual auto pop_domain() -> void                                                                      = 0;
 
     // ---- node factories ----
     virtual auto register_node_factory(std::unique_ptr<node_factory> factory) -> void = 0;
@@ -51,7 +70,7 @@ class CC_CORE_API host_registry
     // matched pairs, the innermost name wins. Public so that host-side code
     // (loader) can drive attribution; plugins themselves never call these.
     //
-    // get_provider_of() looks up which plugin contributed a given node type.
+    // provider_of() looks up which plugin contributed a given node type.
     // Returns an empty string_view for node types registered outside any
     // provider scope (e.g. host-side built-ins) or for unknown type ids.
     //

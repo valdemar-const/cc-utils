@@ -7,4 +7,5 @@ cc_add_plugin(${PROJECT_NAME}
     cc-core::cc-core
     cc-gen::cc-gen    # cc::gen::lower / format
     cc-ir::cc-ir      # cc::ir::module (input value)
+    cc-types-filesystem::cc-types-filesystem # cc::fs::file_handle (output value)
 )

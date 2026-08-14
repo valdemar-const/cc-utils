@@ -5,11 +5,14 @@
 #include "cc/view.hpp"
 
 #include <algorithm>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace cc::runtime
@@ -22,11 +25,27 @@ class type_registry_impl final : public type_registry
 {
   public:
 
+    // Called after each successful registration with the canonical type
+    // name. Wired by host_registry_impl to attribute types to the domain
+    // currently active in the push_domain()/pop_domain() scope.
+    void
+    set_registration_hook(std::function<void(std::string_view)> h)
+    {
+        hook_ = std::move(h);
+    }
+
     auto
     name_of(type_descriptor_t d) const -> std::string_view override
     {
         auto it = desc_to_name_.find(d);
         return it == desc_to_name_.end() ? std::string_view {} : it->second;
+    }
+
+    auto
+    short_name_of(type_descriptor_t d) const -> std::string_view override
+    {
+        auto it = desc_to_short_.find(d);
+        return it == desc_to_short_.end() ? std::string_view {} : it->second;
     }
 
     auto
@@ -51,30 +70,92 @@ class type_registry_impl final : public type_registry
     }
 
     auto
-    register_value_type_impl(std::string_view name, type_descriptor_t d) -> bool override
+    inline_editor_of(type_descriptor_t d) const -> std::optional<property_kind> override
     {
-        if (name == "any")
+        auto name = name_of(d);
+        if (name.empty())
         {
-            if (any_descriptor_ && *any_descriptor_ != d)
+            return std::nullopt;
+        }
+        auto it = ext_by_name_.find(std::string {name});
+        return it == ext_by_name_.end() ? std::nullopt : it->second.inline_control;
+    }
+
+    auto
+    parse_value(type_descriptor_t d, std::string_view text) const
+            -> std::expected<any_value, std::string> override
+    {
+        auto name = name_of(d);
+        if (name.empty())
+        {
+            return std::unexpected("unknown value type");
+        }
+        auto it = ext_by_name_.find(std::string {name});
+        if (it == ext_by_name_.end() || !it->second.parse)
+        {
+            return std::unexpected("type '" + std::string {name} + "' has no inline editor");
+        }
+        return it->second.parse(text);
+    }
+
+    auto
+    register_value_type_impl(value_type_desc d, type_descriptor_t t) -> bool override
+    {
+        // The wildcard input type. Accepted under either spelling for
+        // tolerance towards plugins; hosts register it as "Any".
+        if (d.name == "any" || d.name == "Any")
+        {
+            if (any_descriptor_ && *any_descriptor_ != t)
             {
                 return false;
             }
-            any_descriptor_ = d;
+            any_descriptor_ = t;
         }
-        auto [it_n, inserted_n] = name_to_desc_.try_emplace(std::string {name}, d);
+        auto [it_n, inserted_n] = name_to_desc_.try_emplace(std::string {d.name}, t);
         if (!inserted_n)
         {
-            return it_n->second == d; // idempotent ok, mismatch fails
+            if (it_n->second != t)
+            {
+                return false; // name already bound to a different type
+            }
         }
-        desc_to_name_[d] = std::string {name};
+        // Extension fields (short name, inline editor, parser): first
+        // registration wins; a conflicting re-registration is an error.
+        auto [it_e, inserted_e] = ext_by_name_.try_emplace(std::string {d.name});
+        if (inserted_e)
+        {
+            it_e->second.short_name     = std::string {d.short_name};
+            it_e->second.inline_control = d.inline_control;
+            it_e->second.parse          = std::move(d.parse);
+        }
+        else if (it_e->second.short_name != d.short_name || it_e->second.inline_control != d.inline_control)
+        {
+            return false; // same type, conflicting descriptor
+        }
+        desc_to_name_[t]  = std::string {d.name};
+        desc_to_short_[t] = std::string {d.short_name};
+        if (hook_)
+        {
+            hook_(d.name);
+        }
         return true;
     }
 
   private:
 
+    struct type_ext
+    {
+        std::string                  short_name;
+        std::optional<property_kind> inline_control;
+        value_parse_fn               parse;
+    };
+
     std::unordered_map<std::string, type_descriptor_t> name_to_desc_;
     std::unordered_map<type_descriptor_t, std::string> desc_to_name_;
+    std::unordered_map<type_descriptor_t, std::string> desc_to_short_;
+    std::unordered_map<std::string, type_ext>          ext_by_name_;
     std::optional<type_descriptor_t>                   any_descriptor_;
+    std::function<void(std::string_view)>              hook_;
 };
 
 // ===========================================================================
@@ -143,6 +224,10 @@ class host_registry_impl final : public host_registry
         : types_ {}
         , renderers_ {types_}
     {
+        types_.set_registration_hook([this](std::string_view name)
+                                     {
+                                         attribute_type_to_domain(name);
+                                     });
     }
 
     auto
@@ -157,6 +242,99 @@ class host_registry_impl final : public host_registry
         return types_;
     }
 
+    // ---- vocabulary domains ----
+    auto
+    register_domain(domain_desc d) -> void override
+    {
+        if (d.id.empty())
+        {
+            return;
+        }
+        auto [it, inserted] = domain_index_.try_emplace(d.id, domains_.size());
+        if (inserted)
+        {
+            domains_.push_back(std::move(d));
+            return;
+        }
+        // Merge into the existing descriptor: fill empty metadata (first
+        // non-empty wins), union the dependencies.
+        auto       &existing = domains_[it->second];
+        domain_desc donor    = std::move(d);
+        if (existing.display_name.empty())
+        {
+            existing.display_name = std::move(donor.display_name);
+        }
+        if (existing.description.empty())
+        {
+            existing.description = std::move(donor.description);
+        }
+        for (auto &dep : donor.depends_on)
+        {
+            if (std::find(existing.depends_on.begin(), existing.depends_on.end(), dep) == existing.depends_on.end())
+            {
+                existing.depends_on.push_back(std::move(dep));
+            }
+        }
+    }
+
+    auto
+    find_domain(std::string_view id) const -> const domain_desc * override
+    {
+        auto it = domain_index_.find(std::string {id});
+        return it == domain_index_.end() ? nullptr : &domains_[it->second];
+    }
+
+    auto
+    domains() const -> std::span<const domain_desc> override
+    {
+        return domains_;
+    }
+
+    auto
+    domain_closure(std::span<const std::string_view> roots) const -> std::vector<std::string> override
+    {
+        std::vector<std::string>        out;
+        std::unordered_set<std::string> seen;
+        std::deque<std::string_view>    queue {roots.begin(), roots.end()};
+        while (!queue.empty())
+        {
+            std::string id {queue.front()};
+            queue.pop_front();
+            if (!seen.insert(id).second)
+            {
+                continue;
+            }
+            auto it = domain_index_.find(id);
+            if (it == domain_index_.end())
+            {
+                continue; // unknown ids are surfaced by callers, not here
+            }
+            out.push_back(id);
+            for (const auto &dep : domains_[it->second].depends_on)
+            {
+                queue.push_back(dep);
+            }
+        }
+        return out;
+    }
+
+    auto
+    push_domain(std::string_view id) -> void override
+    {
+        domain_stack_.emplace_back(id);
+        register_domain(domain_desc {std::string {id}, {}, {}, {}, {}});
+    }
+
+    auto
+    pop_domain() -> void override
+    {
+        if (!domain_stack_.empty())
+        {
+            domain_stack_.pop_back();
+        }
+    }
+
+    // ---- node factories ----
     auto
     register_node_factory(std::unique_ptr<node_factory> factory) -> void override
     {
@@ -234,8 +412,30 @@ class host_registry_impl final : public host_registry
 
   private:
 
+    void
+    attribute_type_to_domain(std::string_view type_name)
+    {
+        if (domain_stack_.empty())
+        {
+            return;
+        }
+        auto it = domain_index_.find(domain_stack_.back());
+        if (it == domain_index_.end())
+        {
+            return;
+        }
+        auto &provided = domains_[it->second].provided_types;
+        if (std::find(provided.begin(), provided.end(), type_name) == provided.end())
+        {
+            provided.emplace_back(type_name);
+        }
+    }
+
     type_registry_impl                              types_;
     view_renderer_provider_impl                     renderers_;
+    std::vector<domain_desc>                        domains_;
+    std::unordered_map<std::string, std::size_t>    domain_index_;
+    std::vector<std::string>                        domain_stack_;
     std::vector<std::unique_ptr<node_factory>>      factories_storage_;
     std::unordered_map<std::string, node_factory *> factories_by_id_;
     std::vector<node_factory *>                     factories_order_;

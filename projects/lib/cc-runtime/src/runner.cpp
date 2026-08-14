@@ -8,10 +8,11 @@
 namespace cc::runtime
 {
 
-runner::runner(graph &g, log_callback logger, std::string pipeline_dir)
+runner::runner(graph &g, log_callback logger, std::string pipeline_dir, const type_registry *types)
     : g_ {g}
     , logger_ {std::move(logger)}
     , ctx_ {std::move(pipeline_dir)}
+    , types_ {types}
 {
 }
 
@@ -42,10 +43,26 @@ runner::pull(std::string_view node_id, std::string_view slot_id)
 
     if (target->dir() == slot_dir::in)
     {
-        // Input slot: pull from the upstream source output.
+        // Input slot: pull from the upstream source output. When nothing is
+        // connected, fall back to the slot's inline value (parsed via the
+        // type registry) — mirroring ensure_outputs' resolution order.
         auto src = g_.find_source(node_id, slot_id);
         if (!src)
         {
+            if (types_)
+            {
+                const auto text = n->slot_values().get(slot_id);
+                if (!text.empty())
+                {
+                    auto parsed = types_->parse_value(target->type(), text);
+                    if (!parsed)
+                    {
+                        return std::unexpected(failure {"inline value for '" + std::string {slot_id} + "' on node " + std::string {node_id} + ": " + parsed.error()});
+                    }
+                    auto [it_ins, _ins] = inline_values_.try_emplace(std::string {node_id} + "::" + std::string {slot_id}, std::move(*parsed));
+                    return std::addressof(it_ins->second);
+                }
+            }
             return std::unexpected(failure {"unconnected input '" + std::string {slot_id} + "' on node " + std::string {node_id}});
         }
         return pull(src->first, src->second);
@@ -89,7 +106,9 @@ runner::ensure_outputs(std::string_view node_id) -> std::expected<void, failure>
     }
     in_progress_.insert(key);
 
-    // 1. Resolve each declared input slot via upstream pull.
+    // 1. Resolve each declared input slot via upstream pull. An unconnected
+    //    slot falls back to its inline value (edited in the node body) when
+    //    the slot's type has an inline editor; then to optionality.
     std::vector<input_pair> inputs;
     for (auto *s : n->slots())
     {
@@ -100,6 +119,22 @@ runner::ensure_outputs(std::string_view node_id) -> std::expected<void, failure>
         auto src = g_.find_source(node_id, s->id());
         if (!src)
         {
+            if (types_)
+            {
+                const auto text = n->slot_values().get(s->id());
+                if (!text.empty())
+                {
+                    auto parsed = types_->parse_value(s->type(), text);
+                    if (!parsed)
+                    {
+                        in_progress_.erase(key);
+                        return std::unexpected(failure {"inline value for '" + std::string {s->id()} + "' on node " + key + ": " + parsed.error()});
+                    }
+                    auto [it_ins, _ins] = inline_values_.try_emplace(key + "::" + std::string {s->id()}, std::move(*parsed));
+                    inputs.emplace_back(s->id(), std::addressof(it_ins->second));
+                    continue;
+                }
+            }
             if (!s->is_required())
             {
                 continue; // optional slot, no upstream — fine

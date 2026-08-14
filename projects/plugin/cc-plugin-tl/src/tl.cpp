@@ -3,7 +3,7 @@
 // Replaces the old v2 cc::frontend plugin. Single node:
 //   - tl.frontend: input "src" (text) -> output "ast" (tl.ast)
 //
-// Type "tl.ast" is std::shared_ptr<cc::ast::tl_program>. The shared_ptr wrap
+// Type "Ast" is std::shared_ptr<cc::ast::tl_program>. The shared_ptr wrap
 // is required because tl_program owns a unique_ptr<program> (non-copyable),
 // but any_value is a value-semantic copyable carrier (aa::copy).
 //
@@ -174,6 +174,12 @@ namespace
         }
 
         auto
+        slot_values() -> node_properties & override
+        {
+            return vals_;
+        }
+
+        auto
         activate(std::span<const input_pair> inputs, std::span<output_pair> outputs, const activate_context & /*ctx*/) -> activate_result override
         {
             // Pull the "src" input.
@@ -218,6 +224,7 @@ namespace
 
         std::string id_;
         props       props_;
+        props       vals_;
     };
 
     class frontend_factory final : public node_factory
@@ -240,6 +247,13 @@ namespace
         category() const -> std::string_view override
         {
             return "TL";
+        }
+
+        auto
+        domains() const -> std::span<const std::string_view> override
+        {
+            static constexpr std::string_view ds[] = {"compiler/lang/tl"};
+            return ds;
         }
 
         auto
@@ -273,7 +287,10 @@ cc_plugin_load()
 extern "C" void
 cc_plugin_register(cc::host_registry &r)
 {
-    // Register the wire type so the canvas can render its name + colour.
-    r.types().register_value_type<cc::basic::tl::ast_value>("tl.ast");
+    r.register_domain({.id = "compiler/lang/tl", .display_name = "TL Language", .description = "tl frontend passes: parsing and AST", .depends_on = {"basic/types", "filesystem", "basic/view"}, .provided_types = {}});
+
+    r.push_domain("compiler/lang/tl");
+    r.types().register_value_type<cc::basic::tl::ast_value>({.name = "Ast", .short_name = "ast", .description = "tl syntax tree (shared_ptr<tl_program>)", .inline_control = {}, .parse = {}});
+    r.pop_domain();
     r.register_node_factory(std::make_unique<cc::basic::tl::frontend_factory>());
 }

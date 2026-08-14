@@ -16,8 +16,9 @@
 #include "cc/runner.hpp"
 #include "cc/view.hpp"
 
-#include <cc/astit.hpp> // cc::ast::tl_program, visitor for AST view renderer
-#include <cc/ir.hpp>    // cc::ir::module for IR view renderer
+#include <cc/astit.hpp>            // cc::ast::tl_program, visitor for AST view renderer
+#include <cc/ir.hpp>               // cc::ir::module for IR view renderer
+#include <cc/types/filesystem.hpp> // cc::fs::file_handle / file_attrs for File views
 
 #include "hello_imgui/hello_imgui.h"
 #include "imgui-node-editor/imgui_node_editor.h"
@@ -31,6 +32,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -41,6 +43,7 @@
 #include <thread>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -54,15 +57,15 @@ namespace
 {
 
 #if defined(__linux__)
-#  include <unistd.h> // readlink
+#include <unistd.h> // readlink
 #elif defined(_WIN32)
-#  ifndef NOMINMAX
-#    define NOMINMAX
-#  endif
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  include <windows.h> // GetModuleFileNameA
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h> // GetModuleFileNameA
 #endif
 
 // Directory containing the running executable, as a real filesystem path
@@ -77,17 +80,17 @@ exe_dir()
     ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf));
     if (n > 0)
     {
-        return std::filesystem::path{std::string(buf, static_cast<size_t>(n))}.parent_path();
+        return std::filesystem::path {std::string(buf, static_cast<size_t>(n))}.parent_path();
     }
 #elif defined(_WIN32)
     char  buf[MAX_PATH];
     DWORD n = ::GetModuleFileNameA(nullptr, buf, static_cast<DWORD>(sizeof(buf)));
     if (n > 0 && n < sizeof(buf))
     {
-        return std::filesystem::path{std::string(buf, static_cast<size_t>(n))}.parent_path();
+        return std::filesystem::path {std::string(buf, static_cast<size_t>(n))}.parent_path();
     }
 #endif
-    return std::filesystem::path{"."};
+    return std::filesystem::path {"."};
 }
 
 // ---------------------------------------------------------------------------
@@ -130,16 +133,16 @@ auto
 pin_color_for_type(std::string_view type_name) -> ImVec4
 {
     static const std::unordered_map<std::string_view, ImVec4> known = {
-            {"text", ImVec4(0.35f, 0.60f, 0.95f, 1.0f)},
-            {"path", ImVec4(0.95f, 0.78f, 0.30f, 1.0f)}, // filesystem path — gold
-            {"int", ImVec4(0.25f, 0.85f, 0.85f, 1.0f)},  // integer return code — cyan
-            {"ast", ImVec4(0.62f, 0.40f, 0.78f, 1.0f)},
-            {"ast.tl", ImVec4(0.62f, 0.40f, 0.78f, 1.0f)},
-            {"ir", ImVec4(0.35f, 0.80f, 0.45f, 1.0f)},
-            {"ir.module", ImVec4(0.35f, 0.80f, 0.45f, 1.0f)},
-            {"tl.ast", ImVec4(0.62f, 0.40f, 0.78f, 1.0f)},
-            {"bytes", ImVec4(0.95f, 0.60f, 0.25f, 1.0f)},
-            {"any", ImVec4(0.55f, 0.55f, 0.55f, 1.0f)},
+            {"String", ImVec4(0.35f, 0.60f, 0.95f, 1.0f)},
+            {"Integer", ImVec4(0.25f, 0.85f, 0.85f, 1.0f)}, // integer return code — cyan
+            {"Double", ImVec4(0.30f, 0.70f, 0.90f, 1.0f)},
+            {"Boolean", ImVec4(0.85f, 0.45f, 0.75f, 1.0f)},
+            {"Path", ImVec4(0.95f, 0.78f, 0.30f, 1.0f)}, // filesystem path — gold
+            {"File", ImVec4(0.90f, 0.62f, 0.22f, 1.0f)}, // materialised file — amber
+            {"FileAttrs", ImVec4(0.75f, 0.65f, 0.40f, 1.0f)},
+            {"Ast", ImVec4(0.62f, 0.40f, 0.78f, 1.0f)},
+            {"Module", ImVec4(0.35f, 0.80f, 0.45f, 1.0f)},
+            {"Any", ImVec4(0.55f, 0.55f, 0.55f, 1.0f)},
             {"", ImVec4(0.55f, 0.55f, 0.55f, 1.0f)}, // wildcard / unset
     };
     if (auto it = known.find(type_name); it != known.end())
@@ -152,12 +155,18 @@ pin_color_for_type(std::string_view type_name) -> ImVec4
 auto
 icon_for_type(std::string_view type_name) -> IconType
 {
-    if (type_name == "path" || type_name == "bytes")
+    if (type_name == "Path" || type_name == "File" || type_name == "FileAttrs")
+    {
         return IconType::Diamond;
-    if (type_name == "any" || type_name.empty())
+    }
+    if (type_name == "Any" || type_name.empty())
+    {
         return IconType::Grid;
-    if (type_name == "text" || type_name == "int")
+    }
+    if (type_name == "String" || type_name == "Integer" || type_name == "Double" || type_name == "Boolean")
+    {
         return IconType::Circle;
+    }
     return IconType::Square; // structured (ast/ir/...)
 }
 
@@ -166,6 +175,10 @@ header_color_for_category(std::string_view category) -> ImVec4
 {
     static const std::unordered_map<std::string_view, ImVec4> known = {
             {"Basic", ImVec4(0.15f, 0.45f, 0.60f, 1.0f)},
+            {"Filesystem", ImVec4(0.55f, 0.45f, 0.15f, 1.0f)},
+            {"Text", ImVec4(0.20f, 0.40f, 0.62f, 1.0f)},
+            {"View", ImVec4(0.30f, 0.35f, 0.45f, 1.0f)},
+            {"Process", ImVec4(0.20f, 0.55f, 0.30f, 1.0f)},
             {"TL", ImVec4(0.45f, 0.25f, 0.62f, 1.0f)},
             {"Backend", ImVec4(0.64f, 0.26f, 0.26f, 1.0f)},
             {"I/O", ImVec4(0.20f, 0.55f, 0.30f, 1.0f)},
@@ -186,21 +199,21 @@ constexpr std::string_view kViewTabIcon = "\xf0\x9f\x91\x81"; // 👁 U+1F441 EY
 // ---------------------------------------------------------------------------
 struct ViewTab
 {
-    int          seq = 0;               // monotonic id for unique window label
-    std::string  window_label;          // "View###v<seq>" — stable ImGui ID
-    std::string  source;                // instance_id of the selected view node
+    int         seq = 0;      // monotonic id for unique window label
+    std::string window_label; // "View###v<seq>" — stable ImGui ID
+    std::string source;       // instance_id of the selected view node
 
     // Per-tab cache + background pull (formerly global AppState fields).
-    std::string                                                      cached_for;
-    std::optional<cc::any_value>                                     cached_value;
-    std::string                                                      cached_error;
-    std::string                                                      cached_type_name;
-    bool                                                             cache_stale     = true;
-    std::chrono::steady_clock::time_point                            stale_since     = {};
+    std::string                                                       cached_for;
+    std::optional<cc::any_value>                                      cached_value;
+    std::string                                                       cached_error;
+    std::string                                                       cached_type_name;
+    bool                                                              cache_stale = true;
+    std::chrono::steady_clock::time_point                             stale_since = {};
     std::future<std::pair<std::string, std::optional<cc::any_value>>> pull_future;
-    std::string                                                      pull_target;
-    bool                                                             pull_running     = false;
-    unsigned                                                         pull_started_gen = 0;
+    std::string                                                       pull_target;
+    bool                                                              pull_running     = false;
+    unsigned                                                          pull_started_gen = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -253,6 +266,24 @@ struct AppState
     // True when there are unsaved changes. Bumped by every graph mutation
     // (see invalidate_view_cache); cleared by Save and by New/Open.
     bool pipeline_dirty = false;
+    // Vocabulary-domain contract of the document: root (immutable after
+    // creation) + imports (add-only). Empty root = no pipeline created yet
+    // or a legacy v1 file (pipeline_legacy = true).
+    cc::workbench::pipeline_domains domains;
+    bool                            pipeline_legacy = false;
+
+    // New Pipeline / domain-picker dialog. `migrate` reuses the dialog to
+    // give a legacy (v1) pipeline a domain contract so it can be re-saved.
+    // NOTE: uint8_t (not bool) so the ticks live in a real byte array —
+    // std::vector<bool> is a bit-packed specialisation without contiguous
+    // storage, deliberately avoided.
+    struct
+    {
+        bool                      open     = false;
+        bool                      migrate  = false;
+        int                       root_idx = -1;
+        std::vector<std::uint8_t> imports; // parallel to host domains order
+    } new_pipeline_dlg;
 
     // Modals. Each *_open flag drives a small centered popup; the *_text field
     // carries the message to display. Keeping the data in g_state lets the
@@ -277,8 +308,8 @@ struct AppState
 
     // View tabs — dynamic DockableWindows, each with its own cache + pull.
     std::vector<ViewTab> view_tabs;
-    std::string          last_view_source;      // last-used source (for new tabs)
-    int                  next_view_seq     = 1;
+    std::string          last_view_source; // last-used source (for new tabs)
+    int                  next_view_seq       = 1;
     unsigned             view_invalidate_gen = 0;
 
     // Fonts
@@ -329,8 +360,8 @@ class log_view final
                 std::lock_guard lock(mutex_);
                 buffer_.clear();
                 lines_.clear();
-                dirty_    = false;
-                sel_lo_   = sel_hi_ = -1;
+                dirty_  = false;
+                sel_lo_ = sel_hi_ = -1;
             }
             ImGui::SameLine();
             ImGui::TextDisabled("(%zu lines)", lines_.size());
@@ -339,13 +370,16 @@ class log_view final
         std::lock_guard lock(mutex_);
 
         if (dirty_)
+        {
             rebuild_lines();
+        }
 
         if (g_state.mono_font)
+        {
             ImGui::PushFont(g_state.mono_font);
+        }
 
-        ImGui::BeginChild("##log_text", ImVec2(0, 0), false,
-                          ImGuiWindowFlags_HorizontalScrollbar);
+        ImGui::BeginChild("##log_text", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
 
         const float lh      = ImGui::GetTextLineHeightWithSpacing();
         const float top_y   = ImGui::GetCursorScreenPos().y;
@@ -373,8 +407,8 @@ class log_view final
             && ImGui::GetIO().KeyCtrl
             && ImGui::IsKeyPressed(ImGuiKey_C))
         {
-            int lo = std::min(sel_lo_, sel_hi_);
-            int hi = std::max(sel_lo_, sel_hi_);
+            int         lo = std::min(sel_lo_, sel_hi_);
+            int         hi = std::max(sel_lo_, sel_hi_);
             std::string text;
             for (int i = lo; i <= hi && i < static_cast<int>(lines_.size()); ++i)
             {
@@ -390,7 +424,7 @@ class log_view final
             int lo = (sel_lo_ >= 0) ? std::min(sel_lo_, sel_hi_) : -1;
             int hi = (sel_lo_ >= 0) ? std::max(sel_lo_, sel_hi_) : -1;
 
-            auto *dl = ImGui::GetWindowDrawList();
+            auto  *dl       = ImGui::GetWindowDrawList();
             ImVec2 clip_min = dl->GetClipRectMin();
 
             ImGuiListClipper clipper;
@@ -403,9 +437,10 @@ class log_view final
                     {
                         ImVec2 p = ImGui::GetCursorScreenPos();
                         dl->AddRectFilled(
-                            ImVec2(clip_min.x, p.y),
-                            ImVec2(p.x + 1e4f, p.y + lh),
-                            IM_COL32(55, 95, 145, 130));
+                                ImVec2(clip_min.x, p.y),
+                                ImVec2(p.x + 1e4f, p.y + lh),
+                                IM_COL32(55, 95, 145, 130)
+                        );
                     }
                     const auto &sv = lines_[i];
                     ImGui::TextUnformatted(sv.data(), sv.data() + sv.size());
@@ -416,16 +451,20 @@ class log_view final
 
         // Sticky-to-bottom
         if (dirty_ && follow_ && was_at_bottom_)
+        {
             ImGui::SetScrollHereY(1.0f);
+        }
 
         was_at_bottom_ = ImGui::GetScrollY() >= ImGui::GetScrollMaxY()
-                                 - 2.0f * ImGui::GetTextLineHeight();
+                                                        - 2.0f * ImGui::GetTextLineHeight();
 
         dirty_ = false;
         ImGui::EndChild();
 
         if (g_state.mono_font)
+        {
             ImGui::PopFont();
+        }
     }
 
   private:
@@ -444,17 +483,19 @@ class log_view final
             }
         }
         if (start < buffer_.size())
+        {
             lines_.emplace_back(buffer_.data() + start, buffer_.size() - start);
+        }
     }
 
-    std::string              buffer_;
+    std::string                   buffer_;
     std::vector<std::string_view> lines_;
-    bool                     dirty_        = false;
-    bool                     follow_       = true;
-    bool                     was_at_bottom_ = true;
-    int                      sel_lo_       = -1;
-    int                      sel_hi_       = -1;
-    std::mutex               mutex_;
+    bool                          dirty_         = false;
+    bool                          follow_        = true;
+    bool                          was_at_bottom_ = true;
+    int                           sel_lo_        = -1;
+    int                           sel_hi_        = -1;
+    std::mutex                    mutex_;
 };
 
 AppState           g_state;
@@ -521,7 +562,7 @@ class text_view_renderer final : public cc::view_renderer
     auto
     type_name() const -> std::string_view override
     {
-        return "text";
+        return "String";
     }
 
     auto
@@ -574,7 +615,7 @@ class ir_view_renderer final : public cc::view_renderer
     auto
     type_name() const -> std::string_view override
     {
-        return "ir.module";
+        return "Module";
     }
 
     auto
@@ -583,7 +624,7 @@ class ir_view_renderer final : public cc::view_renderer
         const auto *mod = aa::any_cast<cc::ir::module>(&value);
         if (!mod)
         {
-            ImGui::TextDisabled("view: value is not ir.module");
+            ImGui::TextDisabled("view: value is not a Module");
             return;
         }
         std::string text;
@@ -705,7 +746,7 @@ class ast_view_renderer final : public cc::view_renderer
     auto
     type_name() const -> std::string_view override
     {
-        return "tl.ast";
+        return "Ast";
     }
 
     auto
@@ -714,7 +755,7 @@ class ast_view_renderer final : public cc::view_renderer
         const auto *ast = aa::any_cast<ast_value>(&value);
         if (!ast || !*ast || !(*ast)->root)
         {
-            ImGui::TextDisabled("view: value is not tl.ast (or empty)");
+            ImGui::TextDisabled("view: value is not an Ast (or empty)");
             return;
         }
         ast_view_detail::stringifier s;
@@ -752,7 +793,7 @@ class int_view_renderer final : public cc::view_renderer
     auto
     type_name() const -> std::string_view override
     {
-        return "int";
+        return "Integer";
     }
 
     auto
@@ -761,7 +802,7 @@ class int_view_renderer final : public cc::view_renderer
         const auto *p = aa::any_cast<long>(&value);
         if (!p)
         {
-            ImGui::TextDisabled("view: value is not int (long)");
+            ImGui::TextDisabled("view: value is not an Integer");
             return;
         }
         long          v  = *p;
@@ -796,7 +837,7 @@ class path_view_renderer final : public cc::view_renderer
     auto
     type_name() const -> std::string_view override
     {
-        return "path";
+        return "Path";
     }
 
     auto
@@ -836,6 +877,73 @@ class path_view_renderer final : public cc::view_renderer
 };
 
 // ---------------------------------------------------------------------------
+// File view renderer — shows the handle's path + snapshot metadata.
+// ---------------------------------------------------------------------------
+class file_view_renderer final : public cc::view_renderer
+{
+  public:
+
+    auto
+    type_name() const -> std::string_view override
+    {
+        return "File";
+    }
+
+    auto
+    render(const cc::any_value &value, cc::view_context &) -> void override
+    {
+        const auto *h = aa::any_cast<cc::fs::file_handle>(&value);
+        if (!h)
+        {
+            ImGui::TextDisabled("view: value is not a File handle");
+            return;
+        }
+        const std::string s = h->path.string();
+        ImGui::PushFont(g_state.mono_font);
+        ImGui::TextDisabled("File");
+        ImGui::SameLine();
+        ImGui::TextUnformatted(s.c_str());
+        ImGui::TextDisabled("size: %llu bytes", static_cast<unsigned long long>(h->attrs.size));
+        ImGui::PopFont();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Copy"))
+        {
+            ImGui::SetClipboardText(s.c_str());
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
+// FileAttrs view renderer — the metadata snapshot projected by filesystem.file.
+// ---------------------------------------------------------------------------
+class file_attrs_view_renderer final : public cc::view_renderer
+{
+  public:
+
+    auto
+    type_name() const -> std::string_view override
+    {
+        return "FileAttrs";
+    }
+
+    auto
+    render(const cc::any_value &value, cc::view_context &) -> void override
+    {
+        const auto *a = aa::any_cast<cc::fs::file_attrs>(&value);
+        if (!a)
+        {
+            ImGui::TextDisabled("view: value is not FileAttrs");
+            return;
+        }
+        ImGui::PushFont(g_state.mono_font);
+        ImGui::Text("size:        %llu bytes", static_cast<unsigned long long>(a->size));
+        ImGui::Text("permissions: %o", static_cast<unsigned>(a->permissions));
+        ImGui::Text("modified:    %lld (file_time ticks)", static_cast<long long>(a->modified.time_since_epoch().count()));
+        ImGui::PopFont();
+    }
+};
+
+// ---------------------------------------------------------------------------
 // File-dialog poll + File-menu action openers
 // ---------------------------------------------------------------------------
 // Defined later in this file (after the do_open_pipeline / do_save_pipeline
@@ -851,10 +959,10 @@ void do_save_or_save_as();
 // Schema-driven property widgets
 // ---------------------------------------------------------------------------
 void
-draw_property_widget(cc::node &n, const cc::property_desc &desc)
+draw_property_widget(cc::node &n, cc::node_properties &store, const cc::property_desc &desc)
 {
     ImGui::PushID(desc.key.data());
-    std::string current {n.properties().get(desc.key)};
+    std::string current {store.get(desc.key)};
 
     switch (desc.kind)
     {
@@ -868,7 +976,7 @@ draw_property_widget(cc::node &n, const cc::property_desc &desc)
             ImGui::SetNextItemWidth(180);
             if (ImGui::InputText("##v", buf, sizeof(buf)))
             {
-                n.properties().set(desc.key, buf);
+                store.set(desc.key, buf);
                 invalidate_view_cache();
             }
             ImGui::SameLine();
@@ -888,7 +996,7 @@ draw_property_widget(cc::node &n, const cc::property_desc &desc)
             buf[sizeof(buf) - 1] = 0;
             if (ImGui::InputTextMultiline("##v", buf, sizeof(buf), ImVec2(220, 80)))
             {
-                n.properties().set(desc.key, buf);
+                store.set(desc.key, buf);
                 invalidate_view_cache();
             }
             break;
@@ -908,7 +1016,7 @@ draw_property_widget(cc::node &n, const cc::property_desc &desc)
             ImGui::SetNextItemWidth(120);
             if (ImGui::InputInt("##v", &v, 1, 100))
             {
-                n.properties().set(desc.key, std::to_string(v));
+                store.set(desc.key, std::to_string(v));
                 invalidate_view_cache();
             }
             break;
@@ -918,7 +1026,7 @@ draw_property_widget(cc::node &n, const cc::property_desc &desc)
             bool v = (current == "1" || current == "true");
             if (ImGui::Checkbox(desc.display_name.data(), &v))
             {
-                n.properties().set(desc.key, v ? "1" : "0");
+                store.set(desc.key, v ? "1" : "0");
                 invalidate_view_cache();
             }
             break;
@@ -934,7 +1042,7 @@ draw_property_widget(cc::node &n, const cc::property_desc &desc)
             ImGui::SetNextItemWidth(180);
             if (ImGui::InputText("##v", buf, sizeof(buf)))
             {
-                n.properties().set(desc.key, buf);
+                store.set(desc.key, buf);
                 invalidate_view_cache();
             }
             break;
@@ -959,6 +1067,60 @@ struct create_menu_state
 };
 
 create_menu_state g_create_menu;
+
+// Factories visible in the current pipeline. Legacy mode (no root domain —
+// v1 file or nothing created yet) shows everything; otherwise a factory is
+// visible when ANY of its declared domains lies within the closure of
+// {root ∪ imports}.
+auto
+visible_factories() -> std::vector<cc::node_factory *>
+{
+    const auto &all = g_state.host->node_factories();
+    if (g_state.domains.root.empty())
+    {
+        return {all.begin(), all.end()};
+    }
+    std::vector<std::string_view> roots;
+    roots.push_back(g_state.domains.root);
+    for (const auto &imp : g_state.domains.imports)
+    {
+        roots.push_back(imp);
+    }
+    const auto                      closure = g_state.host->domain_closure(roots);
+    std::set<std::string>           vis {closure.begin(), closure.end()};
+    std::vector<cc::node_factory *> out;
+    for (auto *f : all)
+    {
+        for (auto d : f->domains())
+        {
+            if (vis.count(std::string {d}))
+            {
+                out.push_back(f);
+                break;
+            }
+        }
+    }
+    return out;
+}
+
+// Domain sectioning for the create menu: root first, then imports, then the
+// remaining transitive deps (closure order). Each factory lands in the first
+// section it belongs to.
+auto
+domain_sections() -> std::vector<std::string>
+{
+    if (g_state.domains.root.empty())
+    {
+        return {};
+    }
+    std::vector<std::string_view> roots;
+    roots.push_back(g_state.domains.root);
+    for (const auto &imp : g_state.domains.imports)
+    {
+        roots.push_back(imp);
+    }
+    return g_state.host->domain_closure(roots);
+}
 
 // Palette that opens when the user drags a link from a pin and releases in
 // empty canvas space. Filters node factories to those that have at least one
@@ -1009,48 +1171,101 @@ draw_create_menu()
     {
         ImGui::SeparatorText("Create Node");
 
-        // Group factories by category (alphabetical).
-        std::map<std::string, std::vector<cc::node_factory *>> by_category;
-        for (auto *f : g_state.host->node_factories())
+        const auto factories = visible_factories();
+        if (factories.empty())
         {
-            by_category[std::string {f->category()}].push_back(f);
+            ImGui::TextDisabled("(no node types in this domain)");
         }
-        if (by_category.empty())
+        else if (g_state.domains.root.empty())
         {
-            ImGui::TextDisabled("(no plugins loaded)");
-        }
-
-        for (auto &[category, factories] : by_category)
-        {
-            ImVec4 dot = header_color_for_category(category);
-            ImGui::PushStyleColor(ImGuiCol_Text, dot);
-            bool expanded = ImGui::TreeNodeEx(category.c_str(), ImGuiTreeNodeFlags_DefaultOpen);
-            ImGui::PopStyleColor();
-            if (!expanded)
-            {
-                continue;
-            }
-
+            // Legacy mode: single flat grouping by category.
+            std::map<std::string, std::vector<cc::node_factory *>> by_category;
             for (auto *f : factories)
             {
-                std::string label {f->display_name()};
-                label += "##";
-                label += std::string {f->type_id()};
-                if (ImGui::Selectable(label.c_str()))
-                {
-                    auto        node = f->create();
-                    std::string instance {node->instance_id()};
-                    int         ed_id = editor_id_for(instance);
-                    g_state.g.add_node(std::move(node));
-                    invalidate_view_cache();
-                    // Position is applied next frame inside ed::Begin/End —
-                    // ed::SetNodePosition takes canvas-local coords.
-                    g_state.pending_positions.push_back({ed_id, g_create_menu.canvas_pos});
-                    log("created " + std::string {f->type_id()} + " (instance=" + instance + ")");
-                    g_create_menu.open = false;
-                }
+                by_category[std::string {f->category()}].push_back(f);
             }
-            ImGui::TreePop();
+            for (auto &[category, fs] : by_category)
+            {
+                ImVec4 dot = header_color_for_category(category);
+                ImGui::PushStyleColor(ImGuiCol_Text, dot);
+                bool expanded = ImGui::TreeNodeEx(category.c_str(), ImGuiTreeNodeFlags_DefaultOpen);
+                ImGui::PopStyleColor();
+                if (!expanded)
+                {
+                    continue;
+                }
+                for (auto *f : fs)
+                {
+                    std::string label {f->display_name()};
+                    label += "##";
+                    label += std::string {f->type_id()};
+                    if (ImGui::Selectable(label.c_str()))
+                    {
+                        auto        node = f->create();
+                        std::string instance {node->instance_id()};
+                        int         ed_id = editor_id_for(instance);
+                        g_state.g.add_node(std::move(node));
+                        invalidate_view_cache();
+                        g_state.pending_positions.push_back({ed_id, g_create_menu.canvas_pos});
+                        log("created " + std::string {f->type_id()} + " (instance=" + instance + ")");
+                        g_create_menu.open = false;
+                    }
+                }
+                ImGui::TreePop();
+            }
+        }
+        else
+        {
+            // Domain-sectioned palette: root, imports, then transitive deps.
+            for (const auto &section : domain_sections())
+            {
+                std::vector<cc::node_factory *> section_factories;
+                for (auto *f : factories)
+                {
+                    for (auto d : f->domains())
+                    {
+                        if (d == section)
+                        {
+                            section_factories.push_back(f);
+                            break;
+                        }
+                    }
+                }
+                if (section_factories.empty())
+                {
+                    continue;
+                }
+                const auto *dd  = g_state.host->find_domain(section);
+                ImVec4      dot = hash_color(section);
+                ImGui::PushStyleColor(ImGuiCol_Text, dot);
+                bool expanded = ImGui::TreeNodeEx(
+                        dd && !dd->display_name.empty() ? dd->display_name.c_str() : section.c_str(),
+                        ImGuiTreeNodeFlags_DefaultOpen
+                );
+                ImGui::PopStyleColor();
+                if (!expanded)
+                {
+                    continue;
+                }
+                for (auto *f : section_factories)
+                {
+                    std::string label {f->display_name()};
+                    label += "##";
+                    label += std::string {f->type_id()};
+                    if (ImGui::Selectable(label.c_str()))
+                    {
+                        auto        node = f->create();
+                        std::string instance {node->instance_id()};
+                        int         ed_id = editor_id_for(instance);
+                        g_state.g.add_node(std::move(node));
+                        invalidate_view_cache();
+                        g_state.pending_positions.push_back({ed_id, g_create_menu.canvas_pos});
+                        log("created " + std::string {f->type_id()} + " (instance=" + instance + ")");
+                        g_create_menu.open = false;
+                    }
+                }
+                ImGui::TreePop();
+            }
         }
     }
 
@@ -1110,7 +1325,7 @@ draw_palette_drop()
         }
 
         std::map<std::string, std::vector<cc::node_factory *>> by_category;
-        for (auto *f : g_state.host->node_factories())
+        for (auto *f : visible_factories())
         {
             by_category[std::string {f->category()}].push_back(f);
         }
@@ -1253,10 +1468,11 @@ draw_node(cc::node &n)
     // ---- Header: subtle tinted band with title ----
     // Blender-style: faint category-tinted background, colored dot, title text.
     b.Header(ImVec4(
-        cat_color.x * 0.12f + 0.14f,
-        cat_color.y * 0.12f + 0.14f,
-        cat_color.z * 0.12f + 0.18f,
-        1.0f));
+            cat_color.x * 0.12f + 0.14f,
+            cat_color.y * 0.12f + 0.14f,
+            cat_color.z * 0.12f + 0.18f,
+            1.0f
+    ));
 
     // Category color dot before the title.
     {
@@ -1276,7 +1492,21 @@ draw_node(cc::node &n)
         int             id;
         const cc::slot *slot;
     };
+
     std::vector<out_pin_t> outputs;
+
+    // Pin annotation: `name:short` (e.g. path:path, text:str). Short name
+    // falls back to the canonical name, then to "any" for the wildcard.
+    auto pin_annotation = [&](const cc::slot *s) -> std::string
+    {
+        auto full   = g_state.host->types().name_of(s->type());
+        auto shortn = g_state.host->types().short_name_of(s->type());
+        if (shortn.empty())
+        {
+            shortn = full.empty() ? std::string_view {"any"} : full;
+        }
+        return ":" + std::string {shortn};
+    };
 
     int slot_idx = 0;
     for (auto *slot : n.slots())
@@ -1287,31 +1517,37 @@ draw_node(cc::node &n)
             outputs.push_back({pin_id, slot});
             continue;
         }
-        auto   type_name = g_state.host->types().name_of(slot->type());
+        auto type_name = g_state.host->types().name_of(slot->type());
         if (type_name.empty())
-            type_name = "any";
+        {
+            type_name = "Any";
+        }
         ImVec4   pin_color = pin_color_for_type(type_name);
         IconType pin_icon  = icon_for_type(type_name);
+        auto     annot     = pin_annotation(slot);
 
         b.Input(pin_id);
         Icon(ImVec2(16, 16), pin_icon, true, pin_color, ImVec4(0, 0, 0, 0));
         ImGui::Spring(0);
         ImGui::TextUnformatted(slot->id().data());
         ImGui::Spring(0);
-        ImGui::TextDisabled("%.*s", static_cast<int>(type_name.size()), type_name.data());
+        ImGui::TextDisabled("%s", annot.c_str());
         b.EndInput();
     }
 
     for (const auto &op : outputs)
     {
-        auto   type_name = g_state.host->types().name_of(op.slot->type());
+        auto type_name = g_state.host->types().name_of(op.slot->type());
         if (type_name.empty())
-            type_name = "any";
+        {
+            type_name = "Any";
+        }
         ImVec4   pin_color = pin_color_for_type(type_name);
         IconType pin_icon  = icon_for_type(type_name);
+        auto     annot     = pin_annotation(op.slot);
 
         b.Output(op.id);
-        ImGui::TextDisabled("%.*s", static_cast<int>(type_name.size()), type_name.data());
+        ImGui::TextDisabled("%s", annot.c_str());
         ImGui::Spring(0);
         ImGui::TextUnformatted(op.slot->id().data());
         ImGui::Spring(0);
@@ -1319,13 +1555,66 @@ draw_node(cc::node &n)
         b.EndOutput();
     }
 
-    // ---- Footer: property editor (full width, below pins) ----
+    // ---- Footer: property editor + inline pin values (full width) ----
+    bool has_footer = false;
     if (factory && !factory->property_schema().empty())
     {
-        b.Footer();
-        for (const auto &desc : factory->property_schema())
+        has_footer = true;
+    }
+    else
+    {
+        for (auto *s : n.slots())
         {
-            draw_property_widget(n, desc);
+            if (s->dir() == cc::slot_dir::in && g_state.host->types().inline_editor_of(s->type()))
+            {
+                has_footer = true;
+                break;
+            }
+        }
+    }
+    if (has_footer)
+    {
+        b.Footer();
+        if (factory)
+        {
+            for (const auto &desc : factory->property_schema())
+            {
+                draw_property_widget(n, n.properties(), desc);
+            }
+        }
+        // Inline editors for unconnected input pins whose type is
+        // inline-editable. A connected pin greys the control out — the wire
+        // wins. Values are stored in slot_values() and injected by the
+        // runner via the type's registered parser.
+        for (auto *s : n.slots())
+        {
+            if (s->dir() != cc::slot_dir::in)
+            {
+                continue;
+            }
+            auto kind = g_state.host->types().inline_editor_of(s->type());
+            if (!kind)
+            {
+                continue;
+            }
+            const bool connected = g_state.g.find_source(std::string {n.instance_id()}, s->id()).has_value();
+            ImGui::PushID(s->id().data());
+            if (connected)
+            {
+                ImGui::BeginDisabled();
+            }
+            cc::property_desc pseudo {
+                    std::string_view {s->id()},
+                    std::string_view {s->id()},
+                    *kind,
+                    std::string_view {""},
+            };
+            draw_property_widget(n, n.slot_values(), pseudo);
+            if (connected)
+            {
+                ImGui::EndDisabled();
+            }
+            ImGui::PopID();
         }
     }
 
@@ -1352,7 +1641,9 @@ clear_graph()
     g_state.ed2inst.clear();
     g_state.node_positions.clear();
     for (auto &t : g_state.view_tabs)
+    {
         t.source.clear();
+    }
     invalidate_view_cache();
     log("graph cleared");
 }
@@ -1440,10 +1731,14 @@ do_open_pipeline(const std::string &path) -> bool
         g_state.node_positions[instance] = ImVec2(p.x, p.y);
     }
 
-    g_state.pipeline_path  = path;
-    g_state.pipeline_dirty = false;
+    g_state.pipeline_path   = path;
+    g_state.pipeline_dirty  = false;
+    g_state.domains         = lr.domains;
+    g_state.pipeline_legacy = lr.legacy;
     for (auto &t : g_state.view_tabs)
+    {
         t.source.clear();
+    }
 
     // Auto Zoom-to-Fit so the user sees the restored graph immediately rather
     // than staring at the previously-empty viewport.
@@ -1472,6 +1767,15 @@ do_open_pipeline(const std::string &path) -> bool
     append_group("Missing plugins (some node types may be unavailable):", lr.warnings.missing_plugins);
     append_group("Unknown node types (skipped):", lr.warnings.unknown_node_types);
     append_group("Edges to skipped nodes (skipped):", lr.warnings.skipped_edges);
+    append_group("Imported domains not registered by any loaded plugin:", lr.warnings.missing_domains);
+    if (lr.legacy)
+    {
+        if (!warn_text.empty())
+        {
+            warn_text += "\n\n";
+        }
+        warn_text += "Legacy v1 pipeline: no domain contract.\nAll node types are visible; use File → Migrate to v2 (or Save) to pick a domain and upgrade the file.";
+    }
     if (!warn_text.empty())
     {
         g_state.load_warnings_text = std::move(warn_text);
@@ -1501,7 +1805,7 @@ do_save_pipeline(const std::string &path) -> bool
             positions[id] = {it->second.x, it->second.y};
         }
     }
-    auto res = cc::workbench::save_pipeline(*g_state.host, g_state.g, positions, path);
+    auto res = cc::workbench::save_pipeline(*g_state.host, g_state.g, positions, g_state.domains, path);
     if (!res)
     {
         g_state.load_error_text = res.error();
@@ -1516,14 +1820,15 @@ do_save_pipeline(const std::string &path) -> bool
     return true;
 }
 
-// File → New: clear the canvas, drop the path, start fresh.
+// File → New: open the domain-picker dialog. The graph itself is cleared
+// when the user confirms the domain contract (see draw_new_pipeline_dialog).
 auto
 do_new_pipeline() -> void
 {
-    clear_graph();
-    g_state.pipeline_path.clear();
-    g_state.pipeline_dirty = false;
-    log("new pipeline");
+    g_state.new_pipeline_dlg.open     = true;
+    g_state.new_pipeline_dlg.migrate  = false;
+    g_state.new_pipeline_dlg.root_idx = -1;
+    g_state.new_pipeline_dlg.imports.assign(g_state.host->domains().size(), false);
 }
 
 // Forward decls — the modal handlers reach back into the menu actions.
@@ -1644,6 +1949,16 @@ request_save_as_dialog()
 void
 do_save_or_save_as()
 {
+    if (g_state.domains.root.empty())
+    {
+        // Legacy (v1) pipeline: saving requires a domain contract. Open the
+        // picker in migrate mode; on confirm it continues into the save.
+        g_state.new_pipeline_dlg.open     = true;
+        g_state.new_pipeline_dlg.migrate  = true;
+        g_state.new_pipeline_dlg.root_idx = -1;
+        g_state.new_pipeline_dlg.imports.assign(g_state.host->domains().size(), false);
+        return;
+    }
     if (!g_state.pipeline_path.empty())
     {
         do_save_pipeline(g_state.pipeline_path);
@@ -1652,9 +1967,170 @@ do_save_or_save_as()
     request_save_as_dialog();
 }
 
-// Run the pipeline end-to-end: find an x86_64.assemble node, pull its "exe"
+// ---------------------------------------------------------------------------
+// New Pipeline / Migrate dialog — pick the root vocabulary domain and any
+// extra imports. The root is immutable once the file exists; imports are
+// add-only. In migrate mode the dialog gives a legacy v1 file its contract
+// and then continues into Save.
+// ---------------------------------------------------------------------------
+void
+draw_new_pipeline_dialog()
+{
+    auto &dlg = g_state.new_pipeline_dlg;
+
+    // Latch: the flag is set from a menu handler; open the popup on the next
+    // frame from the same ID stack (same pattern as the About modal).
+    static bool should_open = false;
+    if (dlg.open && !ImGui::IsPopupOpen("New Pipeline"))
+    {
+        should_open = true;
+    }
+    if (should_open)
+    {
+        ImGui::OpenPopup("New Pipeline");
+        should_open = false;
+    }
+
+    const auto &domains = g_state.host->domains();
+
+    ImGui::SetNextWindowSize(ImVec2(560, 0), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal("New Pipeline", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings))
+    {
+        bool valid = dlg.root_idx >= 0 && static_cast<std::size_t>(dlg.root_idx) < domains.size();
+
+        ImGui::TextDisabled(
+                dlg.migrate
+                        ? "Choose the vocabulary domain contract for this legacy pipeline,\nthen it will be re-saved in the v2 format."
+                        : "A pipeline lives in one root vocabulary domain (immutable).\nImports add more vocabularies later; they can be added but never removed."
+        );
+        ImGui::Spacing();
+
+        ImGui::SeparatorText("Root domain");
+        if (domains.empty())
+        {
+            ImGui::TextDisabled("(no domains registered — load a plugin that seeds one)");
+        }
+        auto getter = [](void *data, int idx) -> const char *
+        {
+            const auto                     *ds = static_cast<const std::vector<cc::domain_desc> *>(data);
+            const auto                     &d  = (*ds)[static_cast<std::size_t>(idx)];
+            static thread_local std::string label;
+            label = d.id;
+            if (!d.display_name.empty())
+            {
+                label += "  —  " + d.display_name;
+            }
+            return label.c_str();
+        };
+        ImGui::SetNextItemWidth(420);
+        if (ImGui::Combo("##root_domain", &dlg.root_idx, getter, const_cast<void *>(static_cast<const void *>(&domains)), static_cast<int>(domains.size())))
+        {
+            // Root changed — drop import ticks that would collide with it.
+            if (dlg.root_idx >= 0)
+            {
+                dlg.imports[static_cast<std::size_t>(dlg.root_idx)] = false;
+            }
+        }
+
+        if (valid)
+        {
+            const auto &root = domains[static_cast<std::size_t>(dlg.root_idx)];
+            if (!root.depends_on.empty())
+            {
+                std::string deps = "depends on: ";
+                for (std::size_t i = 0; i < root.depends_on.size(); ++i)
+                {
+                    if (i)
+                    {
+                        deps += ", ";
+                    }
+                    deps += root.depends_on[i];
+                }
+                ImGui::TextDisabled("%s", deps.c_str());
+            }
+            if (!root.provided_types.empty())
+            {
+                std::string types = "provides types: ";
+                for (std::size_t i = 0; i < root.provided_types.size(); ++i)
+                {
+                    if (i)
+                    {
+                        types += ", ";
+                    }
+                    types += root.provided_types[i];
+                }
+                ImGui::TextDisabled("%s", types.c_str());
+            }
+
+            ImGui::Spacing();
+            ImGui::SeparatorText("Import additional domains (optional, add-only)");
+            for (std::size_t i = 0; i < domains.size(); ++i)
+            {
+                if (static_cast<int>(i) == dlg.root_idx)
+                {
+                    continue;
+                }
+                ImGui::PushID(static_cast<int>(i));
+                bool tick = dlg.imports[i];
+                if (ImGui::Checkbox(domains[i].id.c_str(), &tick))
+                {
+                    dlg.imports[i] = tick;
+                }
+                ImGui::PopID();
+            }
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        {
+            float bw = 120.0f;
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (ImGui::GetContentRegionAvail().x - bw * 2 - ImGui::GetStyle().ItemSpacing.x) * 0.5f);
+            ImGui::BeginDisabled(!valid);
+            if (ImGui::Button(dlg.migrate ? "Migrate" : "Create", ImVec2(bw, 0)))
+            {
+                cc::workbench::pipeline_domains chosen;
+                chosen.root = domains[static_cast<std::size_t>(dlg.root_idx)].id;
+                for (std::size_t i = 0; i < domains.size(); ++i)
+                {
+                    if (dlg.imports[i] && static_cast<int>(i) != dlg.root_idx)
+                    {
+                        chosen.imports.push_back(domains[i].id);
+                    }
+                }
+                dlg.open = false;
+                if (dlg.migrate)
+                {
+                    g_state.domains         = std::move(chosen);
+                    g_state.pipeline_legacy = false;
+                    log("migrated pipeline to domain '" + g_state.domains.root + "'");
+                    do_save_or_save_as();
+                }
+                else
+                {
+                    clear_graph();
+                    g_state.pipeline_path.clear();
+                    g_state.pipeline_dirty  = false;
+                    g_state.pipeline_legacy = false;
+                    g_state.domains         = std::move(chosen);
+                    log("new pipeline in domain '" + g_state.domains.root + "'");
+                }
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(bw, 0)))
+            {
+                dlg.open = false;
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::EndPopup();
+    }
+}
+
+// Run the pipeline end-to-end: find an x86_64.assemble node, pull its "file"
 // output (which transitively activates every upstream node), then chmod the
-// resulting path so it is directly executable.
+// resulting artifact so it is directly executable.
 void
 run_pipeline()
 {
@@ -1673,7 +2149,7 @@ run_pipeline()
         return;
     }
 
-    log("run: pulling output 'exe' of " + target + " ...");
+    log("run: pulling output 'file' of " + target + " ...");
     // Forward the pipeline's directory so nodes with path properties can
     // resolve relative entries against it (see activate_context).
     std::string pipeline_dir;
@@ -1685,8 +2161,9 @@ run_pipeline()
                            {
                                ::log(std::string {msg});
                            },
-                           pipeline_dir};
-    auto                result = r.pull(target, "exe");
+                           pipeline_dir,
+                           &g_state.host->types()};
+    auto                result = r.pull(target, "file");
     if (!result)
     {
         log("run failed: " + result.error().what);
@@ -1698,13 +2175,13 @@ run_pipeline()
         log("run: producer returned empty value");
         return;
     }
-    const auto *exe_path = aa::any_cast<std::filesystem::path>(out);
-    if (!exe_path)
+    const auto *artifact = aa::any_cast<cc::fs::file_handle>(out);
+    if (!artifact)
     {
-        log("run: 'exe' output is not a path");
+        log("run: 'file' output is not a File handle");
         return;
     }
-    const std::string exe_str = exe_path->string();
+    const std::string exe_str = artifact->path.string();
     log("run: built " + exe_str);
     if (std::system(("chmod +x " + exe_str).c_str()) == 0)
     {
@@ -1723,8 +2200,10 @@ draw_pipeline_canvas()
     // These commands mutate the graph or the editor view — they belong to the
     // Pipeline tab, not the global menu. Navigate-style buttons set a flag
     // consumed inside ed::Begin/End below, where an editor context is current.
-    const bool busy = std::any_of(g_state.view_tabs.begin(), g_state.view_tabs.end(),
-                                  [](const ViewTab &t) { return t.pull_running; });
+    const bool busy = std::any_of(g_state.view_tabs.begin(), g_state.view_tabs.end(), [](const ViewTab &t)
+                                  {
+                                      return t.pull_running;
+                                  });
     if (busy)
     {
         ImGui::BeginDisabled();
@@ -1752,12 +2231,41 @@ draw_pipeline_canvas()
     {
         std::string pull_label;
         for (const auto &t : g_state.view_tabs)
-            if (t.pull_running) { pull_label = t.pull_target; break; }
+        {
+            if (t.pull_running)
+            {
+                pull_label = t.pull_target;
+                break;
+            }
+        }
         ImGui::TextDisabled("|  COMPUTING: %s ...", pull_label.c_str());
     }
     else
     {
         ImGui::TextDisabled("|  nodes: %zu   edges: %zu", g_state.g.nodes().size(), g_state.g.edges().size());
+        ImGui::SameLine();
+        if (g_state.domains.root.empty())
+        {
+            ImGui::TextDisabled("|  domain: (none — legacy, all nodes visible)");
+        }
+        else
+        {
+            ImGui::TextDisabled("|  domain: %s", g_state.domains.root.c_str());
+            if (!g_state.domains.imports.empty())
+            {
+                std::string imps = " + ";
+                for (std::size_t i = 0; i < g_state.domains.imports.size(); ++i)
+                {
+                    if (i)
+                    {
+                        imps += ", ";
+                    }
+                    imps += g_state.domains.imports[i];
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", imps.c_str());
+            }
+        }
     }
     ImGui::Separator();
 
@@ -1983,8 +2491,12 @@ draw_pipeline_canvas()
                     g_state.g.remove_edges_of(instance);
                     g_state.g.remove_node(instance);
                     for (auto &t : g_state.view_tabs)
+                    {
                         if (t.source == instance)
+                        {
                             t.source.clear();
+                        }
+                    }
                     g_state.inst2ed.erase(instance);
                     g_state.node_positions.erase(instance);
                     g_state.ed2inst.erase(it);
@@ -2076,8 +2588,8 @@ void draw_view_window(ViewTab &tab);
 void
 open_view_tab(const std::string &source)
 {
-    int   seq = g_state.next_view_seq++;
-    auto &tab = g_state.view_tabs.emplace_back();
+    int   seq        = g_state.next_view_seq++;
+    auto &tab        = g_state.view_tabs.emplace_back();
     tab.seq          = seq;
     tab.window_label = "View###v" + std::to_string(seq);
     tab.source       = source;
@@ -2092,11 +2604,13 @@ open_view_tab(const std::string &source)
     w.GuiFunction   = [cap_seq]()
     {
         for (auto &t : g_state.view_tabs)
+        {
             if (t.seq == cap_seq)
             {
                 draw_view_window(t);
                 return;
             }
+        }
     };
     HelloImGui::AddDockableWindow(w);
 }
@@ -2112,8 +2626,11 @@ poll_view_tabs()
     for (auto it = g_state.view_tabs.begin(); it != g_state.view_tabs.end();)
     {
         auto dw_it = std::find_if(
-            docks.begin(), docks.end(),
-            [&](const HelloImGui::DockableWindow &dw) { return dw.label == it->window_label; });
+                docks.begin(), docks.end(), [&](const HelloImGui::DockableWindow &dw)
+                {
+                    return dw.label == it->window_label;
+                }
+        );
 
         if (dw_it != docks.end() && !dw_it->isVisible)
         {
@@ -2176,8 +2693,11 @@ draw_view_window(ViewTab &tab)
 
     // Validate / auto-switch source if the node was deleted or pipeline changed.
     auto found = std::find_if(
-        views.begin(), views.end(),
-        [&](const view_entry &v) { return v.instance == tab.source; });
+            views.begin(), views.end(), [&](const view_entry &v)
+            {
+                return v.instance == tab.source;
+            }
+    );
     if (found == views.end())
     {
         tab.source               = views.front().instance;
@@ -2196,11 +2716,13 @@ draw_view_window(ViewTab &tab)
             tab.window_label = title;
             auto &docks      = HelloImGui::GetRunnerParams()->dockingParams.dockableWindows;
             for (auto &dw : docks)
+            {
                 if (dw.label.find(suffix) != std::string::npos)
                 {
                     dw.label = title;
                     break;
                 }
+            }
         }
     }
 
@@ -2234,7 +2756,7 @@ draw_view_window(ViewTab &tab)
         tab.pull_started_gen = g_state.view_invalidate_gen;
         tab.cached_error.clear();
         std::string target = tab.source;
-        tab.pull_future     = std::async(
+        tab.pull_future    = std::async(
                 std::launch::async,
                 [target]() -> std::pair<std::string, std::optional<cc::any_value>>
                 {
@@ -2249,7 +2771,8 @@ draw_view_window(ViewTab &tab)
                                            {
                                                ::log(std::string {msg});
                                            },
-                                           pipeline_dir};
+                                           pipeline_dir,
+                                           &g_state.host->types()};
                     auto                result = r.pull(target, "in");
                     if (!result)
                     {
@@ -2271,8 +2794,8 @@ draw_view_window(ViewTab &tab)
         if (tab.pull_future.wait_for(0s) == std::future_status::ready)
         {
             auto [error_or_type, value_opt] = tab.pull_future.get();
-            tab.pull_running = false;
-            tab.cached_for   = tab.pull_target;
+            tab.pull_running                = false;
+            tab.cached_for                  = tab.pull_target;
             // Only mark fresh if no graph edit invalidated during this pull AND
             // the source hasn't changed (user switched channel mid-pull).
             if (tab.pull_started_gen == g_state.view_invalidate_gen && tab.pull_target == tab.source)
@@ -2682,6 +3205,8 @@ main()
     g_state.host->renderers().register_renderer(std::make_unique<ast_view_renderer>());
     g_state.host->renderers().register_renderer(std::make_unique<int_view_renderer>());
     g_state.host->renderers().register_renderer(std::make_unique<path_view_renderer>());
+    g_state.host->renderers().register_renderer(std::make_unique<file_view_renderer>());
+    g_state.host->renderers().register_renderer(std::make_unique<file_attrs_view_renderer>());
 
     std::size_t loaded     = g_state.loader.load_all(*g_state.host);
     g_state.loaded_plugins = loaded;
@@ -2714,7 +3239,9 @@ main()
 
         // Ensure at least one View tab exists.
         if (g_state.view_tabs.empty())
+        {
             open_view_tab(g_state.last_view_source);
+        }
 
         poll_view_tabs();
 
@@ -2722,6 +3249,7 @@ main()
         draw_load_error_modal();
         draw_load_warnings_modal();
         draw_unsaved_confirm_modal();
+        draw_new_pipeline_dialog();
     };
 
     // Bottom dock for View + Logger (~40%).
@@ -2775,9 +3303,9 @@ main()
     {
         ImGuiIO                      &io = ImGui::GetIO();
         HelloImGui::FontLoadingParams ui;
-        ui.fontConfig.GlyphRanges = io.Fonts->GetGlyphRangesCyrillic();
+        ui.fontConfig.GlyphRanges       = io.Fonts->GetGlyphRangesCyrillic();
         ui.fontConfig.RasterizerDensity = 2.0f;
-        g_state.ui_font           = HelloImGui::LoadFont("fonts/UI-Regular.ttf", 20.0f, ui);
+        g_state.ui_font                 = HelloImGui::LoadFont("fonts/UI-Regular.ttf", 20.0f, ui);
 
         // Merge monochrome NotoEmoji (vector outlines, not bitmap) into the UI
         // font so emoji glyphs render everywhere — including dock tab titles.
@@ -2785,16 +3313,21 @@ main()
         {
 #if defined(IMGUI_USE_WCHAR32)
             static const ImWchar emoji_ranges[] = {
-                0x1F4FA, 0x1F4FA, // 📺 television
-                0x1F50D, 0x1F50D, // 🔍 magnifying glass
-                0x1F441, 0x1F441, // 👁 eye
-                0x1F600, 0x1F64F, // emoticons
-                0x2764,  0x2764,  // ❤ heart
-                0,
+                    0x1F4FA,
+                    0x1F4FA, // 📺 television
+                    0x1F50D,
+                    0x1F50D, // 🔍 magnifying glass
+                    0x1F441,
+                    0x1F441, // 👁 eye
+                    0x1F600,
+                    0x1F64F, // emoticons
+                    0x2764,
+                    0x2764, // ❤ heart
+                    0,
             };
             HelloImGui::FontLoadingParams em;
-            em.mergeToLastFont        = true;
-            em.fontConfig.GlyphRanges = emoji_ranges;
+            em.mergeToLastFont              = true;
+            em.fontConfig.GlyphRanges       = emoji_ranges;
             em.fontConfig.RasterizerDensity = 2.0f;
             HelloImGui::LoadFont("fonts/NotoEmoji-Regular.ttf", 20.0f, em);
 #endif
@@ -2803,9 +3336,9 @@ main()
         if (HelloImGui::AssetExists("fonts/IBMPlexMono-Regular.ttf"))
         {
             HelloImGui::FontLoadingParams mono;
-            mono.fontConfig.GlyphRanges = io.Fonts->GetGlyphRangesCyrillic();
+            mono.fontConfig.GlyphRanges       = io.Fonts->GetGlyphRangesCyrillic();
             mono.fontConfig.RasterizerDensity = 2.0f;
-            g_state.mono_font           = HelloImGui::LoadFont("fonts/IBMPlexMono-Regular.ttf", 16.0f, mono);
+            g_state.mono_font                 = HelloImGui::LoadFont("fonts/IBMPlexMono-Regular.ttf", 16.0f, mono);
         }
 
         io.FontDefault = g_state.ui_font;

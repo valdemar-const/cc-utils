@@ -170,6 +170,12 @@ namespace
         }
 
         auto
+        slot_values() -> node_properties & override
+        {
+            return vals_;
+        }
+
+        auto
         activate(std::span<const input_pair> inputs, std::span<output_pair> outputs, const activate_context & /*ctx*/) -> activate_result override
         {
             const ast_value *ast_ptr = nullptr;
@@ -206,6 +212,7 @@ namespace
 
         std::string id_;
         props       props_;
+        props       vals_;
     };
 
     class irgen_factory final : public node_factory
@@ -228,6 +235,13 @@ namespace
         category() const -> std::string_view override
         {
             return "TL";
+        }
+
+        auto
+        domains() const -> std::span<const std::string_view> override
+        {
+            static constexpr std::string_view ds[] = {"compiler/lang/tl"};
+            return ds;
         }
 
         auto
@@ -261,10 +275,12 @@ cc_plugin_load()
 extern "C" void
 cc_plugin_register(cc::host_registry &r)
 {
-    // cc-plugin-tl also registers "tl.ast" — idempotent re-register is a no-op
-    // (same name + same descriptor). This keeps the type available even if load
-    // order ever changes.
-    r.types().register_value_type<cc::basic::tl::ast_value>("tl.ast");
-    r.types().register_value_type<cc::ir::module>("ir.module");
+    r.push_domain("compiler/lang/tl");
+    // cc-plugin-tl also registers Ast — idempotent re-register is a no-op
+    // (same name + same descriptor). This keeps the type available even if
+    // load order ever changes.
+    r.types().register_value_type<cc::basic::tl::ast_value>({.name = "Ast", .short_name = "ast", .description = "tl syntax tree (shared_ptr<tl_program>)", .inline_control = {}, .parse = {}});
+    r.types().register_value_type<cc::ir::module>({.name = "Module", .short_name = "ir", .description = "platform-neutral IR module", .inline_control = {}, .parse = {}});
+    r.pop_domain();
     r.register_node_factory(std::make_unique<cc::basic::tl::irgen_factory>());
 }

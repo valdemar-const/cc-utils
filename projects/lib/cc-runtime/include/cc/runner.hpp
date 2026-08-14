@@ -4,6 +4,7 @@
 #include "cc/any_value.hpp"
 #include "cc/graph.hpp"
 #include "cc/node.hpp"
+#include "cc/registry.hpp"
 
 #include <expected>
 #include <functional>
@@ -35,7 +36,12 @@ class CC_RUNTIME_API runner
     // activate_context, so nodes with path-typed properties can resolve
     // relative entries against the .pipeline file's directory. Leave empty
     // for unit tests or in-memory graphs that don't have a file on disk.
-    explicit runner(graph &g, log_callback logger = {}, std::string pipeline_dir = {});
+    //
+    // `types` enables inline pin values: when an input slot is unconnected
+    // but its node carries a slot_values() entry and the slot's type has an
+    // inline editor, the runner parses the text via the registry and injects
+    // the result as a regular input. Null (default) disables the mechanism.
+    explicit runner(graph &g, log_callback logger = {}, std::string pipeline_dir = {}, const type_registry *types = nullptr);
 
     // Pull value at (node_id, slot_id). Recursively activates upstream nodes.
     // Returns a pointer into the runner's cache (stable for the runner's
@@ -52,7 +58,9 @@ class CC_RUNTIME_API runner
     graph                                                                      &g_;
     log_callback                                                                logger_;
     activate_context                                                            ctx_;
+    const type_registry                                                        *types_;
     std::unordered_map<std::string, std::unordered_map<std::string, any_value>> cache_;
+    std::unordered_map<std::string, any_value>                                  inline_values_;
     std::unordered_set<std::string>                                             completed_;
     std::unordered_set<std::string>                                             in_progress_;
 };

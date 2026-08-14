@@ -2,6 +2,7 @@
 
 #include "cc-core_export.hpp"
 #include "cc/node.hpp"
+#include "cc/property_kind.hpp"
 
 #include <memory>
 #include <span>
@@ -9,18 +10,6 @@
 
 namespace cc
 {
-
-// Property kind hints for the workbench's property editor. The host picks the
-// widget that matches the kind; plugins declare one per property in the
-// factory's property_schema().
-enum class property_kind
-{
-    text,      // single-line InputText
-    multiline, // multi-line InputTextMultiline
-    path,      // InputText + "..." Browse button (opens ImFileDialog)
-    integer,   // InputInt
-    boolean,   // Checkbox
-};
 
 // One property descriptor: stable key, display name, kind, default value.
 // The workbench reads the schema to render property widgets generically,
@@ -55,6 +44,19 @@ class CC_CORE_API node_factory
     // Grouping for the canvas context menu, e.g. "Basic", "TL", "Backend".
     // The host groups factories by this string when building the popup.
     virtual auto category() const -> std::string_view = 0;
+
+    // Vocabulary domains this node type belongs to ("filesystem",
+    // "compiler/lang/tl", ...). Membership is self-declared by the node's
+    // provider — including for domains seeded by other plugins (open-world:
+    // a domain is nobody's property, see cc/domain.hpp). A node is visible
+    // in a pipeline when ANY of its domains is within the pipeline's domain
+    // closure. Empty (the default) means the node declares no membership —
+    // visible only in legacy (domainless) pipelines.
+    virtual auto
+    domains() const -> std::span<const std::string_view>
+    {
+        return {};
+    }
 
     // Property schema: descriptors of properties this node type exposes. The
     // host uses this to render generic property editors in the canvas. Default

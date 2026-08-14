@@ -90,8 +90,24 @@ namespace
         }
     }
 
+    auto
+    write_imports(pugi::xml_node root, const std::vector<std::string> &imports) -> void
+    {
+        if (imports.empty())
+        {
+            return;
+        }
+        auto imp = root.append_child("imports");
+        for (const auto &id : imports)
+        {
+            auto d = imp.append_child("domain");
+            append_attribute(d, "id", id);
+        }
+    }
+
     // --------------------------------------------------------------------------
-    // <nodes> — every node with type, instance id, optional <pos>, <properties>.
+    // <nodes> — every node with type, instance id, optional <pos>, <properties>,
+    // <values> (inline pin texts).
     // --------------------------------------------------------------------------
     auto
     write_nodes(pugi::xml_node root, const host_registry &host, const runtime::graph &g, const std::unordered_map<std::string, pos> &positions) -> void
@@ -125,6 +141,26 @@ namespace
                     append_attribute(prop_el, "key", desc.key);
                     prop_el.append_child(pugi::node_pcdata).set_value(value.c_str());
                 }
+            }
+
+            // Inline pin values: every non-empty slot_values() entry, keyed by
+            // input slot id. The runner ignores entries for connected slots (the
+            // wire wins), so saving them all keeps the text the user typed.
+            auto vals_el = node_el.append_child("values");
+            for (auto *s : n->slots())
+            {
+                if (s->dir() != cc::slot_dir::in)
+                {
+                    continue;
+                }
+                std::string value {n->slot_values().get(s->id())};
+                if (value.empty())
+                {
+                    continue;
+                }
+                auto val_el = vals_el.append_child("value");
+                append_attribute(val_el, "slot", s->id());
+                val_el.append_child(pugi::node_pcdata).set_value(value.c_str());
             }
         }
     }
@@ -200,6 +236,39 @@ namespace
     }
 
     auto
+    check_domains(const host_registry &host, const pugi::xml_node &root, pipeline_domains &dom, load_warnings &w) -> std::expected<void, std::string>
+    {
+        dom.root = root.attribute("domain").value();
+        if (dom.root.empty())
+        {
+            return std::unexpected<std::string>("v2 pipeline is missing the domain attribute");
+        }
+        if (!host.find_domain(dom.root))
+        {
+            // The root domain is the document's contract — unavailable vocabulary
+            // is a hard error, not a warning.
+            return std::unexpected<std::string>("root domain '" + dom.root + "' is not registered (install the plugin that provides it)");
+        }
+        if (auto imp = root.child("imports"))
+        {
+            for (auto d = imp.child("domain"); d; d = d.next_sibling("domain"))
+            {
+                auto id = d.attribute("id").value();
+                if (!id || !*id)
+                {
+                    continue;
+                }
+                dom.imports.emplace_back(id);
+                if (!host.find_domain(id))
+                {
+                    w.missing_domains.emplace_back(id);
+                }
+            }
+        }
+        return {};
+    }
+
+    auto
     read_positions(const pugi::xml_node &node_el, const std::string &instance_id, std::unordered_map<std::string, pos> &out) -> void
     {
         auto pos_el = node_el.child("pos");
@@ -245,6 +314,30 @@ namespace
         }
     }
 
+    auto
+    read_values(const pugi::xml_node &node_el, cc::node &n) -> void
+    {
+        auto vals_el = node_el.child("values");
+        if (!vals_el)
+        {
+            return;
+        }
+        for (auto val = vals_el.child("value"); val; val = val.next_sibling("value"))
+        {
+            auto slot = val.attribute("slot").value();
+            if (!slot || !*slot)
+            {
+                continue;
+            }
+            std::string_view text;
+            if (auto pcdata = val.first_child(); pcdata && pcdata.type() == pugi::node_pcdata)
+            {
+                text = pcdata.value();
+            }
+            n.slot_values().set(slot, text);
+        }
+    }
+
 } // namespace
 
 // ===========================================================================
@@ -252,8 +345,13 @@ namespace
 // ===========================================================================
 
 auto
-save_pipeline(const host_registry &host, const runtime::graph &g, const std::unordered_map<std::string, pos> &positions, const std::string &path) -> std::expected<void, std::string>
+save_pipeline(const host_registry &host, const runtime::graph &g, const std::unordered_map<std::string, pos> &positions, const pipeline_domains &domains, const std::string &path) -> std::expected<void, std::string>
 {
+    if (domains.root.empty())
+    {
+        return std::unexpected<std::string>("pipeline has no root domain — create it via the New Pipeline dialog");
+    }
+
     pugi::xml_document doc;
     auto               decl           = doc.prepend_child(pugi::node_declaration);
     decl.append_attribute("version")  = "1.0";
@@ -265,7 +363,9 @@ save_pipeline(const host_registry &host, const runtime::graph &g, const std::uno
         std::snprintf(buf, sizeof(buf), "%d", k_pipeline_format_version);
         root.append_attribute("version").set_value(buf);
     }
+    append_attribute(root, "domain", domains.root);
 
+    write_imports(root, domains.imports);
     write_requires(root, collect_required_plugins(host, g));
     write_nodes(root, host, g, positions);
     write_edges(root, g);
@@ -307,16 +407,24 @@ load_pipeline(const host_registry &host, runtime::graph &g, const std::string &p
     {
         return std::unexpected(version_res.error());
     }
-    if (*version_res != k_pipeline_format_version)
+    if (*version_res > k_pipeline_format_version)
     {
-        // Forward-compatible design: future loaders can migrate older files, but
-        // currently there is only one version. Refuse loudly so the user knows.
-        return std::unexpected<std::string>("unsupported pipeline version " + std::to_string(*version_res) + " (expected " + std::to_string(k_pipeline_format_version) + ")");
+        return std::unexpected<std::string>("unsupported pipeline version " + std::to_string(*version_res) + " (this build understands up to " + std::to_string(k_pipeline_format_version) + ")");
     }
 
     auto root = doc.child("pipeline");
 
     load_result lr;
+    lr.legacy = (*version_res == 1);
+    if (!lr.legacy)
+    {
+        auto dom_res = check_domains(host, root, lr.domains, lr.warnings);
+        if (!dom_res)
+        {
+            return std::unexpected(dom_res.error());
+        }
+    }
+
     check_requires(host, root, lr.warnings);
 
     // Clear the graph up-front. On the happy path the caller will see the new
@@ -368,6 +476,7 @@ load_pipeline(const host_registry &host, runtime::graph &g, const std::string &p
                 continue;
             }
             read_properties(node_el, *n);
+            read_values(node_el, *n);
             read_positions(node_el, inst_id, lr.positions);
             created_ids.emplace(inst_id);
             g.add_node(std::move(n));

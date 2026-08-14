@@ -13,7 +13,10 @@ namespace cc
 //
 // v3: new plugin model — single cc_plugin_register(host_registry&) entry
 //     replaces the old per-stage factories. AnyAny-backed any_value carrier.
-inline constexpr int plugin_api_version = 3;
+// v4: vocabulary domains (node_factory::domains, host_registry domain API,
+//     value_type_desc with short names + inline editors) and
+//     node::slot_values() for inline-edited pin values.
+inline constexpr int plugin_api_version = 4;
 
 // Static metadata returned by cc_plugin_load() for cheap scanning.
 struct plugin_info

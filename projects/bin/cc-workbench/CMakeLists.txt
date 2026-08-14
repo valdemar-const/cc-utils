@@ -10,7 +10,7 @@ cc_add_executable(${PROJECT_NAME}
     ne/builders.cpp
     ne/drawing.cpp
     ne/widgets.cpp
-  PRIVATE_DEPS cc-runtime::cc-runtime cc-astit::cc-astit cc-ir::cc-ir imgui_bundle pugixml::pugixml
+  PRIVATE_DEPS cc-runtime::cc-runtime cc-astit::cc-astit cc-ir::cc-ir cc-types-filesystem::cc-types-filesystem imgui_bundle pugixml::pugixml
 )
 target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 

@@ -1,6 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <pipeline
-  version="1">
+  version="2"
+  domain="compiler/lang/tl">
+  <imports>
+    <domain
+      id="compiler/backend/x86_64" />
+    <domain
+      id="system/process" />
+  </imports>
   <requires>
     <plugin
       name="basic" />
@@ -13,80 +20,112 @@
   </requires>
   <nodes>
     <node
-      type="basic.text.from_file"
-      id="basic.text.from_file#1">
+      type="filesystem.path"
+      id="filesystem.path#1">
       <pos
-        x="-316"
+        x="-903"
         y="124" />
       <properties>
         <property
-          key="path">./examples/42_answer.tl</property>
+          key="value">./examples/42_answer.tl</property>
       </properties>
+      <values />
+    </node>
+    <node
+      type="filesystem.get_file"
+      id="filesystem.get_file#41">
+      <pos
+        x="-316"
+        y="124" />
+      <properties />
+      <values />
+    </node>
+    <node
+      type="filesystem.read_text"
+      id="filesystem.read_text#77">
+      <pos
+        x="-8"
+        y="124" />
+      <properties />
+      <values />
     </node>
     <node
       type="tl.frontend"
       id="tl.frontend#117">
       <pos
-        x="156"
+        x="341"
         y="124" />
       <properties />
+      <values />
     </node>
     <node
       type="tl.irgen"
       id="tl.irgen#213">
       <pos
-        x="447"
+        x="645"
         y="124" />
       <properties />
+      <values />
     </node>
     <node
       type="x86_64.nasm_gen"
       id="x86_64.nasm_gen#555">
       <pos
-        x="766"
+        x="934"
         y="124" />
       <properties />
+      <values />
     </node>
     <node
       type="x86_64.assemble"
       id="x86_64.assemble#706">
       <pos
-        x="1129"
+        x="1323"
         y="124" />
       <properties>
         <property
           key="out_path">./out</property>
       </properties>
+      <values />
     </node>
     <node
       type="basic.exec"
       id="basic.exec#1685">
       <pos
         x="1752"
-        y="126" />
+        y="124" />
       <properties>
         <property
           key="merge_stderr">false</property>
+        <property
+          key="timeout_ms">0</property>
       </properties>
+      <values />
     </node>
     <node
       type="basic.view"
       id="basic.view#2030">
       <pos
-        x="2408"
+        x="2296"
         y="124" />
       <properties>
         <property
           key="name">view</property>
       </properties>
+      <values />
     </node>
   </nodes>
   <edges>
     <edge
-      src_node="basic.text.from_file#1"
-      src_slot="out"
-      dst_node="tl.frontend#117"
-      dst_slot="src" />
+      src_node="filesystem.path#1"
+      src_slot="path"
+      dst_node="filesystem.get_file#41"
+      dst_slot="path" />
+    <edge
+      src_node="filesystem.get_file#41"
+      src_slot="file"
+      dst_node="filesystem.read_text#77"
+      dst_slot="file" />
     <edge
       src_node="tl.frontend#117"
       src_slot="ast"
@@ -104,13 +143,18 @@
       dst_slot="asm" />
     <edge
       src_node="x86_64.assemble#706"
-      src_slot="exe"
+      src_slot="file"
       dst_node="basic.exec#1685"
-      dst_slot="exe" />
+      dst_slot="file" />
     <edge
       src_node="basic.exec#1685"
       src_slot="ret_code"
       dst_node="basic.view#2030"
       dst_slot="in" />
+    <edge
+      src_node="filesystem.read_text#77"
+      src_slot="text"
+      dst_node="tl.frontend#117"
+      dst_slot="src" />
   </edges>
 </pipeline>

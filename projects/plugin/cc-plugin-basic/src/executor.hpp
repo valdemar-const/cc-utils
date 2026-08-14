@@ -31,9 +31,12 @@ namespace cc::basic
 {
 
 struct win32_tag
-{};
+{
+};
+
 struct linux_tag
-{};
+{
+};
 
 #if defined(_WIN32)
 using native_tag = win32_tag;
@@ -61,18 +64,18 @@ template<>
 struct basic_executor<linux_tag>
 {
     static std::expected<exec_result, exec_error>
-    exec(std::string_view         exe,
-         std::string_view         args            = {},
-         std::optional<unsigned>  timeout_ms      = std::nullopt);
+    exec(std::string_view        exe,
+         std::string_view        args       = {},
+         std::optional<unsigned> timeout_ms = std::nullopt);
 };
 
 template<>
 struct basic_executor<win32_tag>
 {
     static std::expected<exec_result, exec_error>
-    exec(std::string_view         exe,
-         std::string_view         args            = {},
-         std::optional<unsigned>  timeout_ms      = std::nullopt);
+    exec(std::string_view        exe,
+         std::string_view        args       = {},
+         std::optional<unsigned> timeout_ms = std::nullopt);
 };
 
 // The native instantiation: cc::basic::executor::exec(...).

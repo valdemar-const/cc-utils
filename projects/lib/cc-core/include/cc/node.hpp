@@ -67,6 +67,14 @@ class CC_CORE_API node_properties
     virtual auto set(std::string_view key, std::string_view value) -> void = 0;
 };
 
+// Per-instance inline values of a node's INPUT slots, keyed by slot id
+// ("path" -> "/tmp/a.tl"). Written by the host's property editor when the
+// user edits an unconnected inlineable input pin in the node body; parsed and
+// injected by the runner via the slot type's registered inline editor. Nodes
+// never read this map inside activate() — they consume the injected pairs in
+// `inputs` like any connected value. Entries for connected slots are ignored
+// by the runner (the wire wins), and the editor greys the control out.
+
 // Activation result. Either all output slots populated, or a failure carrying
 // a diagnostic. The runner fills `inputs`, the node fills `outputs`.
 // (Final shape of inputs/outputs is provisional; using simple spans for MVP.)
@@ -108,6 +116,11 @@ class CC_CORE_API node
     // Topology + per-instance configuration
     virtual auto slots() const -> std::span<const slot * const> = 0;
     virtual auto properties() -> node_properties &              = 0;
+
+    // Inline-edited values for this instance's input slots (see the comment
+    // block above node_properties). Plugins typically back it with the same
+    // map implementation as properties().
+    virtual auto slot_values() -> node_properties & = 0;
 
     // Computation. Runner resolves each declared input slot id to its current
     // value (pull-based), calls activate; the node populates each declared output

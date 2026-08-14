@@ -52,17 +52,17 @@ namespace
         ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf));
         if (n > 0)
         {
-            return std::filesystem::path{std::string(buf, static_cast<size_t>(n))}.parent_path();
+            return std::filesystem::path {std::string(buf, static_cast<size_t>(n))}.parent_path();
         }
 #elif defined(_WIN32)
         char  buf[MAX_PATH];
         DWORD n = ::GetModuleFileNameA(nullptr, buf, static_cast<DWORD>(sizeof(buf)));
         if (n > 0 && n < sizeof(buf))
         {
-            return std::filesystem::path{std::string(buf, static_cast<size_t>(n))}.parent_path();
+            return std::filesystem::path {std::string(buf, static_cast<size_t>(n))}.parent_path();
         }
 #endif
-        return std::filesystem::path{"."};
+        return std::filesystem::path {"."};
     }
 
     auto

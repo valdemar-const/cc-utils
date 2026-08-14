@@ -199,3 +199,45 @@ Help
 5. **Save layout restore в .pipeline**: помимо <pos> добавить zoom/viewport
 6. **Multi-document**: несколько Pipeline табов (каждый со своим графом и
    file path). Требует AppState → vector<PipelineDoc> + active-tab state
+
+## Шаг 7 — Домены предметной области ✅ (plugin API v4, формат v2)
+
+Конвенция — см. `plans/domains.md`. Реализовано:
+
+- **cc-core**: `domain.hpp` (`domain_desc`), `register_domain/find_domain/
+  domains/domain_closure/push_domain/pop_domain` на `host_registry`;
+  `node_factory::domains()` (мульти-членство, самозаявляемое);
+  `value_type_desc` (PascalCase name + short_name + inline_editor) в
+  `type_registry` (+ `short_name_of/inline_editor_of/parse_value`);
+  `node::slot_values()` для inline-значений пинов; `property_kind` вынесен в
+  `cc/property_kind.hpp`; `plugin_api_version = 4`
+- **cc-types-filesystem** (новый тип-пакет): `cc::fs::file_handle`,
+  `cc::fs::file_attrs`, `stat_file` — typeinfo якорится в одной .so для
+  cross-DSO any_cast
+- **cc-runtime**: merge-регистрация доменов, BFS-замыкание deps (циклы
+  безопасны), атрибуция типов через push_domain-scope; runner: 4-й аргумент
+  `const type_registry*` — инъекция inline-значений (и в ensure_outputs, и в
+  pull входного слота)
+- **Плагины**: basic сеет 5 доменов (basic/types, filesystem, basic/text,
+  basic/view, system/process) + 5 filesystem-узлов (path-let, get_file,
+  get_or_create_file, file-инспектор, read_text); exec на входе File;
+  tl/tl-ir в `compiler/lang/tl` (мульти-вендор); x86_64 в
+  `compiler/backend/x86_64`, assemble выдаёт File-хендл артефакта;
+  `basic.text.from_file` удалён
+- **pipeline_xml v2**: атрибут `domain` + `<imports>` + `<values>`;
+  root-домен обязателен (hard error если не зарегистрирован), import-миccинг
+  — warning; v1 — legacy-режим (все фабрики видимы) + миграция через Save;
+  save без root-домена — ошибка
+- **Workbench**: диалог New Pipeline / Migrate (root + чекбоксы imports,
+  показывает deps/provided_types); create-menu секциями по доменам
+  (root → imports → transitive deps), legacy — плоско по категориям;
+  drag-palette под тем же фильтром; подписи пинов `name:short`;
+  inline-редакторы в теле узла с грейаутом при подключённом проводе;
+  домен в тулбаре; File/FileAttrs view-рендереры; тики диалога —
+  `vector<uint8_t>` (не `vector<bool>`)
+- **Тесты**: 46/46 — closure/membership/provided_types, inline-инъекция,
+  strict-vs-lenient материализация, v2 round-trip, v1-legacy, missing
+  root/import, e2e `return_42` на 8-узельной цепочке
+- **Прочее**: `gtest-1.18.0.zip` добавлен в CPM preload (`cpm add`),
+  `cpm requires bump GTest` — уже 1.18.0; ассет `test.tl.pipeline`
+  мигрирован на v2

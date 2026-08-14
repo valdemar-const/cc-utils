@@ -4,8 +4,9 @@
 // opaque `emit()` call, so the NASM listing is observable on a wire (and can
 // be viewed, edited, or piped to a different assembler):
 //
-//   - x86_64.nasm_gen:   input "ir" (ir.module)  -> output "asm" (text)
-//   - x86_64.assemble:   input "asm" (text)        -> output "exe" (text path)
+//   - x86_64.nasm_gen:   input "ir" (Module)  -> output "asm" (String)
+//   - x86_64.assemble:   input "asm" (String) -> output "file" (File handle
+//                        of the linked artifact, metadata snapshot included)
 //                        + property "out_path" (filesystem path to write)
 //
 // The split makes it possible to debug the lowering step (View the listing)
@@ -16,6 +17,7 @@
 #include "cc/node.hpp"
 #include "cc/node_factory.hpp"
 #include "cc/plugin_entry.hpp"
+#include "cc/types/filesystem.hpp"
 
 #include <cc/gen.hpp> // cc::gen::lower / format
 #include <cc/ir.hpp>  // cc::ir::module
@@ -165,13 +167,13 @@ namespace
         auto
         id() const -> std::string_view override
         {
-            return "exe";
+            return "file";
         }
 
         auto
         type() const -> type_descriptor_t override
         {
-            return descriptor_of<std::filesystem::path>;
+            return descriptor_of<cc::fs::file_handle>;
         }
 
         auto
@@ -232,6 +234,12 @@ namespace
         }
 
         auto
+        slot_values() -> node_properties & override
+        {
+            return vals_;
+        }
+
+        auto
         activate(std::span<const input_pair> inputs, std::span<output_pair> outputs, const activate_context & /*ctx*/) -> activate_result override
         {
             const cc::ir::module *mod = nullptr;
@@ -268,6 +276,7 @@ namespace
 
         std::string id_;
         props       props_;
+        props       vals_;
     };
 
     class nasm_gen_factory final : public node_factory
@@ -290,6 +299,13 @@ namespace
         category() const -> std::string_view override
         {
             return "Backend";
+        }
+
+        auto
+        domains() const -> std::span<const std::string_view> override
+        {
+            static constexpr std::string_view ds[] = {"compiler/backend/x86_64"};
+            return ds;
         }
 
         auto
@@ -351,6 +367,12 @@ namespace
         }
 
         auto
+        slot_values() -> node_properties & override
+        {
+            return vals_;
+        }
+
+        auto
         activate(std::span<const input_pair> inputs, std::span<output_pair> outputs, const activate_context &ctx) -> activate_result override
         {
             const std::string *asm_text = nullptr;
@@ -383,7 +405,7 @@ namespace
             // path::operator/ is purely lexical: joining dir/".​/out" leaves the
             // redundant "." in place (…\assets\.\out). Collapse it so the asm/
             // obj/exe paths are canonical instead of carrying a ".\" artifact.
-            exe = exe.lexically_normal();
+            exe                             = exe.lexically_normal();
             std::filesystem::path asm_path  = exe;
             asm_path                       += ".asm";
             std::filesystem::path obj_path  = exe;
@@ -404,7 +426,8 @@ namespace
             // start with the tool name, never a quote, so cmd /c's outer-quote
             // strip rule (which only fires when the string begins with ") never
             // triggers — the quotes reach nasm/gcc/ld intact.
-            auto quote = [](const std::filesystem::path &p) {
+            auto quote = [](const std::filesystem::path &p)
+            {
                 return "\"" + p.string() + "\"";
             };
             log("assemble[" + id_ + "]: running nasm");
@@ -453,23 +476,29 @@ namespace
 #endif
             std::remove(asm_path.string().c_str());
             std::remove(obj_path.string().c_str());
+            auto handle = cc::fs::stat_file(exe);
+            if (!handle)
+            {
+                return std::unexpected(failure {"linked artifact missing: '" + exe.string() + "'"});
+            }
             log("assemble[" + id_ + "]: ok, exe = " + exe.string());
 
             for (auto &[slot_id, out] : outputs)
             {
-                if (slot_id == "exe")
+                if (slot_id == "file")
                 {
-                    *out = exe;
+                    *out = std::move(*handle);
                     return {};
                 }
             }
-            return std::unexpected(failure {"no 'exe' output slot on " + id_});
+            return std::unexpected(failure {"no 'file' output slot on " + id_});
         }
 
       private:
 
         std::string id_;
         props       props_;
+        props       vals_;
     };
 
     class assemble_factory final : public node_factory
@@ -492,6 +521,13 @@ namespace
         category() const -> std::string_view override
         {
             return "Backend";
+        }
+
+        auto
+        domains() const -> std::span<const std::string_view> override
+        {
+            static constexpr std::string_view ds[] = {"compiler/backend/x86_64"};
+            return ds;
         }
 
         auto
@@ -534,8 +570,12 @@ cc_plugin_load()
 extern "C" void
 cc_plugin_register(cc::host_registry &r)
 {
-    // ir.module is also registered by cc-plugin-tl-ir; idempotent re-register.
-    r.types().register_value_type<cc::ir::module>("ir.module");
+    r.register_domain({.id = "compiler/backend/x86_64", .display_name = "x86_64 Backend", .description = "NASM codegen and ELF assembly", .depends_on = {"basic/types"}, .provided_types = {}});
+
+    r.push_domain("compiler/backend/x86_64");
+    // Module is also registered by cc-plugin-tl-ir; idempotent re-register.
+    r.types().register_value_type<cc::ir::module>({.name = "Module", .short_name = "ir", .description = "platform-neutral IR module", .inline_control = {}, .parse = {}});
+    r.pop_domain();
     r.register_node_factory(std::make_unique<cc::basic::x86_64::nasm_gen_factory>());
     r.register_node_factory(std::make_unique<cc::basic::x86_64::assemble_factory>());
 }

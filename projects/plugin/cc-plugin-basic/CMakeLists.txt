@@ -6,6 +6,7 @@ cc_add_plugin(${PROJECT_NAME}
     src/executor.cpp
   PUBLIC_DEPS
     cc-core::cc-core
+    cc-types-filesystem::cc-types-filesystem
   PRIVATE_DEPS
     Boost::process
     Boost::system

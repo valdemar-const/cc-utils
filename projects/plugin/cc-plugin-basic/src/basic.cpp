@@ -1,27 +1,27 @@
-// cc-plugin-basic — basic node plugin (no UI).
+// cc-plugin-basic — basic + filesystem + process node plugin (no UI).
 //
-// Registers:
-//   wire types: text (std::string), path (std::filesystem::path), int (long)
-//   nodes:
-//     - text.from_file: reads file content from a "path" property → outputs text
-//     - view:           debug tap, accepts any value
-//     - exec:           runs an executable, returns ret_code/cout/cerr
+// Seeds vocabulary domains:
+//   basic/types      — String, Integer, Double, Boolean, Any (wildcard)
+//   filesystem       — Path, File, FileAttrs + file/path nodes
+//   basic/text       — text.constant
+//   basic/view       — view (debug tap)
+//   system/process   — exec
 //
-// exec delegates to cc::basic::executor (see executor.hpp), a platform-tagged
-// runner: raw Win32 CreateProcess on Windows, boost.process v2 on POSIX. The
-// node itself is fully platform-agnostic — it only wires the executor's result
-// into its ret_code/cout/cerr slots. std::filesystem::path is used for every
-// filesystem location — no platform-specific path encoding.
+// Value types carry short pin annotations (name:short) and inline editors
+// for primitives; the runner parses inline texts and injects them as regular
+// input values. File is an opaque handle type anchored in
+// libcc-types-filesystem (cross-DSO contract).
 
 #include "cc/any_value.hpp"
 #include "cc/host.hpp"
 #include "cc/node.hpp"
 #include "cc/node_factory.hpp"
 #include "cc/plugin_entry.hpp"
+#include "cc/types/filesystem.hpp"
 #include "executor.hpp"
 
 #include <atomic>
-#include <cstdlib> // std::strtoul
+#include <cstdlib> // std::strtoll
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -32,6 +32,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace cc::basic
@@ -49,7 +50,7 @@ namespace
         return std::string {type_id} + "#" + std::to_string(n);
     }
 
-    // Minimal property bag for plugin-local nodes.
+    // Minimal property bag for plugin-local nodes (also backs slot_values()).
     class props final : public node_properties
     {
       public:
@@ -73,79 +74,117 @@ namespace
     };
 
     // ---------------------------------------------------------------------------
-    // Slots — reused across nodes where the wire type matches.
+    // Slots — one parameterised class; static instances live inside each
+    // node's slots() override so addresses stay stable.
     // ---------------------------------------------------------------------------
-    class text_out_slot final : public slot
+    class basic_slot final : public slot
     {
       public:
+
+        basic_slot(std::string_view id, type_descriptor_t type, slot_dir dir, slot_card card, bool required = true)
+            : id_ {id}
+            , type_ {type}
+            , dir_ {dir}
+            , card_ {card}
+            , required_ {required}
+        {
+        }
 
         auto
         id() const -> std::string_view override
         {
-            return "out";
+            return id_;
         }
 
         auto
         type() const -> type_descriptor_t override
         {
-            return descriptor_of<std::string>;
+            return type_;
         }
 
         auto
         dir() const -> slot_dir override
         {
-            return slot_dir::out;
+            return dir_;
         }
 
         auto
         card() const -> slot_card override
         {
-            return slot_card::single;
+            return card_;
         }
+
+        auto
+        is_required() const -> bool override
+        {
+            return required_;
+        }
+
+      private:
+
+        std::string_view  id_;
+        type_descriptor_t type_;
+        slot_dir          dir_;
+        slot_card         card_;
+        bool              required_;
     };
 
-    class any_in_slot final : public slot
+    constexpr auto str_t   = descriptor_of<std::string>;
+    constexpr auto path_t  = descriptor_of<std::filesystem::path>;
+    constexpr auto file_t  = descriptor_of<cc::fs::file_handle>;
+    constexpr auto attrs_t = descriptor_of<cc::fs::file_attrs>;
+    constexpr auto int_t   = descriptor_of<long>;
+    constexpr auto any_t   = descriptor_of<std::monostate>; // wildcard
+
+    // Resolve a relative path against the pipeline's directory (relocatable
+    // .pipeline files); absolute paths pass through verbatim.
+    auto
+    resolve_path(std::string_view raw, const activate_context &ctx) -> std::filesystem::path
+    {
+        std::filesystem::path p {raw};
+        if (!p.is_absolute() && !ctx.pipeline_dir.empty())
+        {
+            p = std::filesystem::path {ctx.pipeline_dir} / p;
+        }
+        return p.lexically_normal();
+    }
+
+    auto
+    find_input(std::span<const input_pair> inputs, std::string_view slot_id) -> const any_value *
+    {
+        for (auto [id, value] : inputs)
+        {
+            if (id == slot_id)
+            {
+                return value;
+            }
+        }
+        return nullptr;
+    }
+
+    // ---------------------------------------------------------------------------
+    // filesystem.path — typed let-node for Path values.
+    //
+    //   in (optional) ─┐
+    //                  ├─▶ out:path   (the connected wire wins; the
+    //   property "value" ─┘            property is the fallback)
+    //
+    // Fan-out point for reusing one path across several consumers, and the
+    // canonical constant source for pipelines that prefer explicit nodes.
+    // The input slot is named "in" (not "path") — slot ids share one
+    // namespace per node, and a colliding in/out pair would make edge
+    // resolution ambiguous.
+    // ---------------------------------------------------------------------------
+    class path_node final : public node
     {
       public:
 
-        auto
-        id() const -> std::string_view override
-        {
-            return "in";
-        }
-
-        auto
-        type() const -> type_descriptor_t override
-        {
-            return type_descriptor_t {};
-        } // wildcard
-
-        auto
-        dir() const -> slot_dir override
-        {
-            return slot_dir::in;
-        }
-
-        auto
-        card() const -> slot_card override
-        {
-            return slot_card::multi;
-        }
-    };
-
-    // ---------------------------------------------------------------------------
-    // text.from_file node — reads a file from the "path" property.
-    // ---------------------------------------------------------------------------
-    class from_file_node final : public node
-    {
-      public:
-
-        from_file_node()
-            : id_(fresh_instance_id("basic.text.from_file"))
+        path_node()
+            : id_(fresh_instance_id("filesystem.path"))
         {
         }
 
-        explicit from_file_node(std::string id)
+        explicit path_node(std::string id)
             : id_(std::move(id))
         {
         }
@@ -153,7 +192,7 @@ namespace
         auto
         type_id() const -> std::string_view override
         {
-            return "basic.text.from_file";
+            return "filesystem.path";
         }
 
         auto
@@ -165,8 +204,9 @@ namespace
         auto
         slots() const -> std::span<const slot * const> override
         {
-            static const text_out_slot   s_out {};
-            static constexpr const slot *arr[] = {&s_out};
+            static const basic_slot      s_in {"in", path_t, slot_dir::in, slot_card::single, false};
+            static const basic_slot      s_out {"path", path_t, slot_dir::out, slot_card::single};
+            static constexpr const slot *arr[] = {&s_in, &s_out};
             return arr;
         }
 
@@ -177,84 +217,82 @@ namespace
         }
 
         auto
-        activate(std::span<const input_pair>, std::span<output_pair> outputs, const activate_context &ctx) -> activate_result override
+        slot_values() -> node_properties & override
         {
-            std::string raw {props_.get("path")};
-            if (raw.empty())
-            {
-                return std::unexpected(failure {"'path' not set"});
-            }
-            // Resolve relative paths against the pipeline's parent directory so the
-            // .pipeline file is relocatable: the user types `./test.tl`, save/load
-            // preserve the text verbatim, and the file resolves to a different
-            // absolute path depending on where the .pipeline file was opened from.
-            // Absolute paths are taken verbatim. Empty pipeline_dir (in-memory graph,
-            // unit tests) → leave the string as-is, std::ifstream resolves against
-            // the process working directory.
-            std::filesystem::path path {raw};
-            if (!path.is_absolute() && !ctx.pipeline_dir.empty())
-            {
-                path = std::filesystem::path {ctx.pipeline_dir} / path;
-            }
-            // Collapse redundant "."/".." left by the lexical join above (e.g.
-            // a property of "./source.txt" would otherwise read as …\dir\.\source.txt).
-            path = path.lexically_normal();
-            log("from_file[" + id_ + "]: opening " + path.string());
-            std::ifstream in(path);
-            if (!in)
-            {
-                log("from_file[" + id_ + "]: cannot open");
-                return std::unexpected(failure {"cannot open '" + path.string() + "'"});
-            }
-            std::ostringstream ss;
-            ss << in.rdbuf();
-            auto content = ss.str();
-            log("from_file[" + id_ + "]: read " + std::to_string(content.size()) + " bytes");
+            return vals_;
+        }
 
+        auto
+        activate(std::span<const input_pair> inputs, std::span<output_pair> outputs, const activate_context & /*ctx*/) -> activate_result override
+        {
+            std::filesystem::path value;
+            if (const auto *wired = find_input(inputs, "in"))
+            {
+                if (const auto *p = aa::any_cast<std::filesystem::path>(wired))
+                {
+                    value = *p;
+                }
+            }
+            else
+            {
+                value = std::filesystem::path {std::string {props_.get("value")}};
+            }
+            if (value.empty())
+            {
+                return std::unexpected(failure {"path not set (connect 'in' or set the 'value' property)"});
+            }
             for (auto &[slot_id, out] : outputs)
             {
-                if (slot_id == "out")
+                if (slot_id == "path")
                 {
-                    *out = std::move(content);
+                    *out = value;
                     return {};
                 }
             }
-            return std::unexpected(failure {"no 'out' slot on " + id_});
+            return std::unexpected(failure {"no 'path' slot on " + id_});
         }
 
       private:
 
         std::string id_;
         props       props_;
+        props       vals_;
     };
 
-    class from_file_factory final : public node_factory
+    class path_factory final : public node_factory
     {
       public:
 
         auto
         type_id() const -> std::string_view override
         {
-            return "basic.text.from_file";
+            return "filesystem.path";
         }
 
         auto
         display_name() const -> std::string_view override
         {
-            return "Source File";
+            return "Path";
         }
 
         auto
         category() const -> std::string_view override
         {
-            return "Basic";
+            return "Filesystem";
+        }
+
+        auto
+        domains() const -> std::span<const std::string_view> override
+        {
+            static constexpr std::string_view ds[] = {"filesystem"};
+            return ds;
         }
 
         auto
         property_schema() const -> std::span<const property_desc> override
         {
             static constexpr property_desc schema[] = {
-                    {"path", "File Path", property_kind::path, ""},
+                    {"value", "Value (when 'in' is not connected)", property_kind::path, ""},
             };
             return schema;
         }
@@ -262,21 +300,539 @@ namespace
         auto
         create() const -> std::unique_ptr<node> override
         {
-            return apply_defaults(std::make_unique<from_file_node>());
+            return apply_defaults(std::make_unique<path_node>());
         }
 
         auto
         create_with_id(std::string_view instance_id) const
                 -> std::unique_ptr<node> override
         {
-            return apply_defaults(std::make_unique<from_file_node>(std::string {instance_id}));
+            return apply_defaults(std::make_unique<path_node>(std::string {instance_id}));
         }
     };
 
     // ---------------------------------------------------------------------------
-    // text.constant node — emits a literal string entered in the property editor
-    // (multiline). Useful for args / inline source / hardcoded values without a
-    // round-trip through a file on disk.
+    // filesystem.get_file — strict materialisation Path → File. Fails when the
+    // file does not exist (the None case of the Optional<File> mental model).
+    // ---------------------------------------------------------------------------
+    class get_file_node final : public node
+    {
+      public:
+
+        get_file_node()
+            : id_(fresh_instance_id("filesystem.get_file"))
+        {
+        }
+
+        explicit get_file_node(std::string id)
+            : id_(std::move(id))
+        {
+        }
+
+        auto
+        type_id() const -> std::string_view override
+        {
+            return "filesystem.get_file";
+        }
+
+        auto
+        instance_id() const -> std::string_view override
+        {
+            return id_;
+        }
+
+        auto
+        slots() const -> std::span<const slot * const> override
+        {
+            static const basic_slot      s_in {"path", path_t, slot_dir::in, slot_card::single};
+            static const basic_slot      s_out {"file", file_t, slot_dir::out, slot_card::single};
+            static constexpr const slot *arr[] = {&s_in, &s_out};
+            return arr;
+        }
+
+        auto
+        properties() -> node_properties & override
+        {
+            return props_;
+        }
+
+        auto
+        slot_values() -> node_properties & override
+        {
+            return vals_;
+        }
+
+        auto
+        activate(std::span<const input_pair> inputs, std::span<output_pair> outputs, const activate_context &ctx) -> activate_result override
+        {
+            const auto *wired = find_input(inputs, "path");
+            const auto *p     = wired ? aa::any_cast<std::filesystem::path>(wired) : nullptr;
+            if (!p || p->empty())
+            {
+                return std::unexpected(failure {"'path' input not connected or empty"});
+            }
+            auto resolved = resolve_path(p->string(), ctx);
+            auto handle   = cc::fs::stat_file(resolved);
+            if (!handle)
+            {
+                log("get_file[" + id_ + "]: no such file '" + resolved.string() + "'");
+                return std::unexpected(failure {"file does not exist: '" + resolved.string() + "'"});
+            }
+            for (auto &[slot_id, out] : outputs)
+            {
+                if (slot_id == "file")
+                {
+                    *out = std::move(*handle);
+                    return {};
+                }
+            }
+            return std::unexpected(failure {"no 'file' slot on " + id_});
+        }
+
+      private:
+
+        std::string id_;
+        props       props_;
+        props       vals_;
+    };
+
+    class get_file_factory final : public node_factory
+    {
+      public:
+
+        auto
+        type_id() const -> std::string_view override
+        {
+            return "filesystem.get_file";
+        }
+
+        auto
+        display_name() const -> std::string_view override
+        {
+            return "Get File";
+        }
+
+        auto
+        category() const -> std::string_view override
+        {
+            return "Filesystem";
+        }
+
+        auto
+        domains() const -> std::span<const std::string_view> override
+        {
+            static constexpr std::string_view ds[] = {"filesystem"};
+            return ds;
+        }
+
+        auto
+        create() const -> std::unique_ptr<node> override
+        {
+            return apply_defaults(std::make_unique<get_file_node>());
+        }
+
+        auto
+        create_with_id(std::string_view instance_id) const
+                -> std::unique_ptr<node> override
+        {
+            return apply_defaults(std::make_unique<get_file_node>(std::string {instance_id}));
+        }
+    };
+
+    // ---------------------------------------------------------------------------
+    // filesystem.get_or_create_file — lenient materialisation Path → File for
+    // write targets: creates an empty regular file when missing, then stats.
+    // ---------------------------------------------------------------------------
+    class get_or_create_node final : public node
+    {
+      public:
+
+        get_or_create_node()
+            : id_(fresh_instance_id("filesystem.get_or_create_file"))
+        {
+        }
+
+        explicit get_or_create_node(std::string id)
+            : id_(std::move(id))
+        {
+        }
+
+        auto
+        type_id() const -> std::string_view override
+        {
+            return "filesystem.get_or_create_file";
+        }
+
+        auto
+        instance_id() const -> std::string_view override
+        {
+            return id_;
+        }
+
+        auto
+        slots() const -> std::span<const slot * const> override
+        {
+            static const basic_slot      s_in {"path", path_t, slot_dir::in, slot_card::single};
+            static const basic_slot      s_out {"file", file_t, slot_dir::out, slot_card::single};
+            static constexpr const slot *arr[] = {&s_in, &s_out};
+            return arr;
+        }
+
+        auto
+        properties() -> node_properties & override
+        {
+            return props_;
+        }
+
+        auto
+        slot_values() -> node_properties & override
+        {
+            return vals_;
+        }
+
+        auto
+        activate(std::span<const input_pair> inputs, std::span<output_pair> outputs, const activate_context &ctx) -> activate_result override
+        {
+            const auto *wired = find_input(inputs, "path");
+            const auto *p     = wired ? aa::any_cast<std::filesystem::path>(wired) : nullptr;
+            if (!p || p->empty())
+            {
+                return std::unexpected(failure {"'path' input not connected or empty"});
+            }
+            auto            resolved = resolve_path(p->string(), ctx);
+            std::error_code ec;
+            if (!std::filesystem::exists(resolved, ec))
+            {
+                std::ofstream os {resolved, std::ios::app};
+                if (!os)
+                {
+                    return std::unexpected(failure {"cannot create '" + resolved.string() + "'"});
+                }
+                log("get_or_create_file[" + id_ + "]: created " + resolved.string());
+            }
+            auto handle = cc::fs::stat_file(resolved);
+            if (!handle)
+            {
+                return std::unexpected(failure {"not a regular file: '" + resolved.string() + "'"});
+            }
+            for (auto &[slot_id, out] : outputs)
+            {
+                if (slot_id == "file")
+                {
+                    *out = std::move(*handle);
+                    return {};
+                }
+            }
+            return std::unexpected(failure {"no 'file' slot on " + id_});
+        }
+
+      private:
+
+        std::string id_;
+        props       props_;
+        props       vals_;
+    };
+
+    class get_or_create_factory final : public node_factory
+    {
+      public:
+
+        auto
+        type_id() const -> std::string_view override
+        {
+            return "filesystem.get_or_create_file";
+        }
+
+        auto
+        display_name() const -> std::string_view override
+        {
+            return "Get or Create File";
+        }
+
+        auto
+        category() const -> std::string_view override
+        {
+            return "Filesystem";
+        }
+
+        auto
+        domains() const -> std::span<const std::string_view> override
+        {
+            static constexpr std::string_view ds[] = {"filesystem"};
+            return ds;
+        }
+
+        auto
+        create() const -> std::unique_ptr<node> override
+        {
+            return apply_defaults(std::make_unique<get_or_create_node>());
+        }
+
+        auto
+        create_with_id(std::string_view instance_id) const
+                -> std::unique_ptr<node> override
+        {
+            return apply_defaults(std::make_unique<get_or_create_node>(std::string {instance_id}));
+        }
+    };
+
+    // ---------------------------------------------------------------------------
+    // filesystem.file — inspector ("тройник"): passes the handle through and
+    // exposes a projection of its metadata snapshot. No I/O at activation.
+    // ---------------------------------------------------------------------------
+    class file_node final : public node
+    {
+      public:
+
+        file_node()
+            : id_(fresh_instance_id("filesystem.file"))
+        {
+        }
+
+        explicit file_node(std::string id)
+            : id_(std::move(id))
+        {
+        }
+
+        auto
+        type_id() const -> std::string_view override
+        {
+            return "filesystem.file";
+        }
+
+        auto
+        instance_id() const -> std::string_view override
+        {
+            return id_;
+        }
+
+        auto
+        slots() const -> std::span<const slot * const> override
+        {
+            static const basic_slot      s_in {"file", file_t, slot_dir::in, slot_card::single};
+            static const basic_slot      s_out {"file", file_t, slot_dir::out, slot_card::single};
+            static const basic_slot      s_attrs {"attrs", attrs_t, slot_dir::out, slot_card::single};
+            static constexpr const slot *arr[] = {&s_in, &s_out, &s_attrs};
+            return arr;
+        }
+
+        auto
+        properties() -> node_properties & override
+        {
+            return props_;
+        }
+
+        auto
+        slot_values() -> node_properties & override
+        {
+            return vals_;
+        }
+
+        auto
+        activate(std::span<const input_pair> inputs, std::span<output_pair> outputs, const activate_context & /*ctx*/) -> activate_result override
+        {
+            const auto *wired = find_input(inputs, "file");
+            const auto *h     = wired ? aa::any_cast<cc::fs::file_handle>(wired) : nullptr;
+            if (!h)
+            {
+                return std::unexpected(failure {"'file' input not connected or wrong type"});
+            }
+            for (auto &[slot_id, out] : outputs)
+            {
+                if (slot_id == "file")
+                {
+                    *out = *h;
+                }
+                else if (slot_id == "attrs")
+                {
+                    *out = h->attrs;
+                }
+            }
+            return {};
+        }
+
+      private:
+
+        std::string id_;
+        props       props_;
+        props       vals_;
+    };
+
+    class file_factory final : public node_factory
+    {
+      public:
+
+        auto
+        type_id() const -> std::string_view override
+        {
+            return "filesystem.file";
+        }
+
+        auto
+        display_name() const -> std::string_view override
+        {
+            return "File";
+        }
+
+        auto
+        category() const -> std::string_view override
+        {
+            return "Filesystem";
+        }
+
+        auto
+        domains() const -> std::span<const std::string_view> override
+        {
+            static constexpr std::string_view ds[] = {"filesystem"};
+            return ds;
+        }
+
+        auto
+        create() const -> std::unique_ptr<node> override
+        {
+            return apply_defaults(std::make_unique<file_node>());
+        }
+
+        auto
+        create_with_id(std::string_view instance_id) const
+                -> std::unique_ptr<node> override
+        {
+            return apply_defaults(std::make_unique<file_node>(std::string {instance_id}));
+        }
+    };
+
+    // ---------------------------------------------------------------------------
+    // filesystem.read_text — File handle → String content.
+    // ---------------------------------------------------------------------------
+    class read_text_node final : public node
+    {
+      public:
+
+        read_text_node()
+            : id_(fresh_instance_id("filesystem.read_text"))
+        {
+        }
+
+        explicit read_text_node(std::string id)
+            : id_(std::move(id))
+        {
+        }
+
+        auto
+        type_id() const -> std::string_view override
+        {
+            return "filesystem.read_text";
+        }
+
+        auto
+        instance_id() const -> std::string_view override
+        {
+            return id_;
+        }
+
+        auto
+        slots() const -> std::span<const slot * const> override
+        {
+            static const basic_slot      s_in {"file", file_t, slot_dir::in, slot_card::single};
+            static const basic_slot      s_out {"text", str_t, slot_dir::out, slot_card::single};
+            static constexpr const slot *arr[] = {&s_in, &s_out};
+            return arr;
+        }
+
+        auto
+        properties() -> node_properties & override
+        {
+            return props_;
+        }
+
+        auto
+        slot_values() -> node_properties & override
+        {
+            return vals_;
+        }
+
+        auto
+        activate(std::span<const input_pair> inputs, std::span<output_pair> outputs, const activate_context & /*ctx*/) -> activate_result override
+        {
+            const auto *wired = find_input(inputs, "file");
+            const auto *h     = wired ? aa::any_cast<cc::fs::file_handle>(wired) : nullptr;
+            if (!h)
+            {
+                return std::unexpected(failure {"'file' input not connected or wrong type"});
+            }
+            std::ifstream in {h->path};
+            if (!in)
+            {
+                return std::unexpected(failure {"cannot open '" + h->path.string() + "'"});
+            }
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            auto content = ss.str();
+            log("read_text[" + id_ + "]: read " + std::to_string(content.size()) + " bytes from " + h->path.string());
+            for (auto &[slot_id, out] : outputs)
+            {
+                if (slot_id == "text")
+                {
+                    *out = std::move(content);
+                    return {};
+                }
+            }
+            return std::unexpected(failure {"no 'text' slot on " + id_});
+        }
+
+      private:
+
+        std::string id_;
+        props       props_;
+        props       vals_;
+    };
+
+    class read_text_factory final : public node_factory
+    {
+      public:
+
+        auto
+        type_id() const -> std::string_view override
+        {
+            return "filesystem.read_text";
+        }
+
+        auto
+        display_name() const -> std::string_view override
+        {
+            return "Read Text";
+        }
+
+        auto
+        category() const -> std::string_view override
+        {
+            return "Filesystem";
+        }
+
+        auto
+        domains() const -> std::span<const std::string_view> override
+        {
+            static constexpr std::string_view ds[] = {"filesystem"};
+            return ds;
+        }
+
+        auto
+        create() const -> std::unique_ptr<node> override
+        {
+            return apply_defaults(std::make_unique<read_text_node>());
+        }
+
+        auto
+        create_with_id(std::string_view instance_id) const
+                -> std::unique_ptr<node> override
+        {
+            return apply_defaults(std::make_unique<read_text_node>(std::string {instance_id}));
+        }
+    };
+
+    // ---------------------------------------------------------------------------
+    // basic.text.constant — emits a literal string entered in the property
+    // editor (multiline).
     // ---------------------------------------------------------------------------
     class constant_node final : public node
     {
@@ -307,7 +863,7 @@ namespace
         auto
         slots() const -> std::span<const slot * const> override
         {
-            static const text_out_slot   s_out {};
+            static const basic_slot      s_out {"text", str_t, slot_dir::out, slot_card::single};
             static constexpr const slot *arr[] = {&s_out};
             return arr;
         }
@@ -319,25 +875,32 @@ namespace
         }
 
         auto
+        slot_values() -> node_properties & override
+        {
+            return vals_;
+        }
+
+        auto
         activate(std::span<const input_pair>, std::span<output_pair> outputs, const activate_context & /*ctx*/) -> activate_result override
         {
             std::string value {props_.get("value")};
             log("text.constant[" + id_ + "]: emitting " + std::to_string(value.size()) + " bytes");
             for (auto &[slot_id, out] : outputs)
             {
-                if (slot_id == "out")
+                if (slot_id == "text")
                 {
                     *out = std::move(value);
                     return {};
                 }
             }
-            return std::unexpected(failure {"no 'out' slot on " + id_});
+            return std::unexpected(failure {"no 'text' slot on " + id_});
         }
 
       private:
 
         std::string id_;
         props       props_;
+        props       vals_;
     };
 
     class constant_factory final : public node_factory
@@ -359,7 +922,14 @@ namespace
         auto
         category() const -> std::string_view override
         {
-            return "Basic";
+            return "Text";
+        }
+
+        auto
+        domains() const -> std::span<const std::string_view> override
+        {
+            static constexpr std::string_view ds[] = {"basic/text"};
+            return ds;
         }
 
         auto
@@ -386,7 +956,8 @@ namespace
     };
 
     // ---------------------------------------------------------------------------
-    // view node — debug tap, accepts any type.
+    // basic.view — debug tap, accepts any type. The View panel pulls the
+    // upstream value directly via the runner.
     // ---------------------------------------------------------------------------
     class view_node final : public node
     {
@@ -417,7 +988,7 @@ namespace
         auto
         slots() const -> std::span<const slot * const> override
         {
-            static const any_in_slot     s_in {};
+            static const basic_slot      s_in {"in", any_t, slot_dir::in, slot_card::multi, false};
             static constexpr const slot *arr[] = {&s_in};
             return arr;
         }
@@ -428,7 +999,12 @@ namespace
             return props_;
         }
 
-        // Sinks; the View panel pulls upstream value directly via the runner.
+        auto
+        slot_values() -> node_properties & override
+        {
+            return vals_;
+        }
+
         auto
         activate(std::span<const input_pair>, std::span<output_pair>, const activate_context & /*ctx*/) -> activate_result override
         {
@@ -439,6 +1015,7 @@ namespace
 
         std::string id_;
         props       props_;
+        props       vals_;
     };
 
     class view_factory final : public node_factory
@@ -460,7 +1037,14 @@ namespace
         auto
         category() const -> std::string_view override
         {
-            return "Basic";
+            return "View";
+        }
+
+        auto
+        domains() const -> std::span<const std::string_view> override
+        {
+            static constexpr std::string_view ds[] = {"basic/view"};
+            return ds;
         }
 
         auto
@@ -487,171 +1071,14 @@ namespace
     };
 
     // ---------------------------------------------------------------------------
-    // exec node — runs an executable, exposes ret_code / cout / cerr as wires.
+    // basic.exec — runs an executable File, exposes ret_code / cout / cerr.
     //
-    //   inputs:  exe (path), args (text, optional)
-    //   outputs: ret_code (long), cout (text), cerr (text)
+    //   inputs:  file (File — the executable handle), args (String, optional)
+    //   outputs: ret_code (Integer), cout (String), cerr (String)
     //   properties:
     //     merge_stderr (bool, default false) — fold stderr into stdout (2>&1)
     //     timeout_ms   (int,  default 0)      — kill the child after N ms (0=none)
-    //
-    // Subprocess launch + capture is delegated to cc::basic::executor (see
-    // executor.hpp), which picks a working launcher per platform (raw Win32 on
-    // Windows, boost.process v2 on POSIX). merge_stderr is applied here in
-    // software: the executor always returns separate stdout/stderr.
     // ---------------------------------------------------------------------------
-    class path_in_exe_slot final : public slot
-    {
-      public:
-
-        auto
-        id() const -> std::string_view override
-        {
-            return "exe";
-        }
-
-        auto
-        type() const -> type_descriptor_t override
-        {
-            return descriptor_of<std::filesystem::path>;
-        }
-
-        auto
-        dir() const -> slot_dir override
-        {
-            return slot_dir::in;
-        }
-
-        auto
-        card() const -> slot_card override
-        {
-            return slot_card::single;
-        }
-    };
-
-    class text_in_args_slot final : public slot
-    {
-      public:
-
-        auto
-        id() const -> std::string_view override
-        {
-            return "args";
-        }
-
-        auto
-        type() const -> type_descriptor_t override
-        {
-            return descriptor_of<std::string>;
-        }
-
-        auto
-        dir() const -> slot_dir override
-        {
-            return slot_dir::in;
-        }
-
-        auto
-        card() const -> slot_card override
-        {
-            return slot_card::single;
-        }
-
-        // Optional — exec without args is legitimate (the process just runs plainly).
-        auto
-        is_required() const -> bool override
-        {
-            return false;
-        }
-    };
-
-    class long_out_slot final : public slot
-    {
-      public:
-
-        auto
-        id() const -> std::string_view override
-        {
-            return "ret_code";
-        }
-
-        auto
-        type() const -> type_descriptor_t override
-        {
-            return descriptor_of<long>;
-        }
-
-        auto
-        dir() const -> slot_dir override
-        {
-            return slot_dir::out;
-        }
-
-        auto
-        card() const -> slot_card override
-        {
-            return slot_card::single;
-        }
-    };
-
-    class text_out_cout_slot final : public slot
-    {
-      public:
-
-        auto
-        id() const -> std::string_view override
-        {
-            return "cout";
-        }
-
-        auto
-        type() const -> type_descriptor_t override
-        {
-            return descriptor_of<std::string>;
-        }
-
-        auto
-        dir() const -> slot_dir override
-        {
-            return slot_dir::out;
-        }
-
-        auto
-        card() const -> slot_card override
-        {
-            return slot_card::single;
-        }
-    };
-
-    class text_out_cerr_slot final : public slot
-    {
-      public:
-
-        auto
-        id() const -> std::string_view override
-        {
-            return "cerr";
-        }
-
-        auto
-        type() const -> type_descriptor_t override
-        {
-            return descriptor_of<std::string>;
-        }
-
-        auto
-        dir() const -> slot_dir override
-        {
-            return slot_dir::out;
-        }
-
-        auto
-        card() const -> slot_card override
-        {
-            return slot_card::single;
-        }
-    };
-
     class exec_node final : public node
     {
       public:
@@ -681,12 +1108,12 @@ namespace
         auto
         slots() const -> std::span<const slot * const> override
         {
-            static const path_in_exe_slot   s_exe {};
-            static const text_in_args_slot  s_args {};
-            static const long_out_slot      s_ret {};
-            static const text_out_cout_slot s_cout {};
-            static const text_out_cerr_slot s_cerr {};
-            static constexpr const slot    *arr[] = {&s_exe, &s_args, &s_ret, &s_cout, &s_cerr};
+            static const basic_slot      s_file {"file", file_t, slot_dir::in, slot_card::single};
+            static const basic_slot      s_args {"args", str_t, slot_dir::in, slot_card::single, false};
+            static const basic_slot      s_ret {"ret_code", int_t, slot_dir::out, slot_card::single};
+            static const basic_slot      s_cout {"cout", str_t, slot_dir::out, slot_card::single};
+            static const basic_slot      s_cerr {"cerr", str_t, slot_dir::out, slot_card::single};
+            static constexpr const slot *arr[] = {&s_file, &s_args, &s_ret, &s_cout, &s_cerr};
             return arr;
         }
 
@@ -697,46 +1124,42 @@ namespace
         }
 
         auto
+        slot_values() -> node_properties & override
+        {
+            return vals_;
+        }
+
+        auto
         activate(std::span<const input_pair> inputs, std::span<output_pair> outputs, const activate_context & /*ctx*/) -> activate_result override
         {
-            const std::filesystem::path *exe_p  = nullptr;
-            const std::string           *args_s = nullptr;
-            for (auto [slot_id, value] : inputs)
+            const auto *wired_file = find_input(inputs, "file");
+            const auto *exe_f      = wired_file ? aa::any_cast<cc::fs::file_handle>(wired_file) : nullptr;
+            const auto *wired_args = find_input(inputs, "args");
+            const auto *args_s     = wired_args ? aa::any_cast<std::string>(wired_args) : nullptr;
+            if (!exe_f || exe_f->path.empty())
             {
-                if (slot_id == "exe" && value)
-                {
-                    exe_p = aa::any_cast<std::filesystem::path>(value);
-                }
-                if (slot_id == "args" && value)
-                {
-                    args_s = aa::any_cast<std::string>(value);
-                }
-            }
-            if (!exe_p || exe_p->empty())
-            {
-                return std::unexpected(failure {"'exe' input not connected or empty"});
+                return std::unexpected(failure {"'file' input not connected or empty"});
             }
 
             const bool merge = props_.get("merge_stderr") == "true"
                             || props_.get("merge_stderr") == "1";
 
-            // Optional timeout, in milliseconds. Malformed / zero values → none.
             std::optional<unsigned> timeout;
             if (auto sv = props_.get("timeout_ms"); !sv.empty())
             {
-                char           *end = nullptr;
-                unsigned long   ms  = std::strtoul(sv.data(), &end, 10);
+                char         *end = nullptr;
+                unsigned long ms  = std::strtoul(sv.data(), &end, 10);
                 if (end != sv.data() && ms != 0)
+                {
                     timeout = static_cast<unsigned>(ms);
+                }
             }
 
-            std::string exe  = exe_p->string();
+            std::string exe  = exe_f->path.string();
             std::string args = args_s ? *args_s : std::string {};
 
             log("exec[" + id_ + "]: spawn " + exe + (args.empty() ? "" : " " + args));
 
-            // Hand off to the platform executor: raw Win32 on Windows, boost.
-            // process v2 on POSIX. Both return {code, out, err} or an error.
             auto r = executor::exec(exe, args, timeout);
             if (!r)
             {
@@ -777,6 +1200,7 @@ namespace
 
         std::string id_;
         props       props_;
+        props       vals_;
     };
 
     class exec_factory final : public node_factory
@@ -798,7 +1222,14 @@ namespace
         auto
         category() const -> std::string_view override
         {
-            return "Basic";
+            return "Process";
+        }
+
+        auto
+        domains() const -> std::span<const std::string_view> override
+        {
+            static constexpr std::string_view ds[] = {"system/process"};
+            return ds;
         }
 
         auto
@@ -825,6 +1256,91 @@ namespace
         }
     };
 
+    // ---------------------------------------------------------------------------
+    // Inline editors + validators for primitive types.
+    // ---------------------------------------------------------------------------
+    auto
+    parse_string(std::string_view text) -> std::expected<any_value, std::string>
+    {
+        any_value v {};
+        v = std::string {text};
+        return v;
+    }
+
+    auto
+    parse_integer(std::string_view text) -> std::expected<any_value, std::string>
+    {
+        std::string s {text};
+        char       *end = nullptr;
+        const long  n   = std::strtoll(s.c_str(), &end, 10);
+        if (end == s.c_str() || *end != '\0')
+        {
+            return std::unexpected("'" + s + "' is not an integer");
+        }
+        any_value v {};
+        v = n;
+        return v;
+    }
+
+    auto
+    parse_double(std::string_view text) -> std::expected<any_value, std::string>
+    {
+        std::string  s {text};
+        char        *end = nullptr;
+        const double d   = std::strtod(s.c_str(), &end);
+        if (end == s.c_str() || *end != '\0')
+        {
+            return std::unexpected("'" + s + "' is not a number");
+        }
+        any_value v {};
+        v = d;
+        return v;
+    }
+
+    auto
+    parse_boolean(std::string_view text) -> std::expected<any_value, std::string>
+    {
+        bool b = false;
+        if (text == "true" || text == "1")
+        {
+            b = true;
+        }
+        else if (text == "false" || text == "0")
+        {
+            b = false;
+        }
+        else
+        {
+            return std::unexpected("'" + std::string {text} + "' is not a boolean (true/false)");
+        }
+        any_value v {};
+        v = b;
+        return v;
+    }
+
+    auto
+    parse_path(std::string_view text) -> std::expected<any_value, std::string>
+    {
+        if (text.empty())
+        {
+            return std::unexpected("path must not be empty");
+        }
+        any_value v {};
+        v = std::filesystem::path {text};
+        return v;
+    }
+
+    // RAII domain attribution scope (mirrors the loader's provider guard).
+    struct domain_scope
+    {
+        host_registry &h;
+
+        ~domain_scope()
+        {
+            h.pop_domain();
+        }
+    };
+
 } // namespace
 
 } // namespace cc::basic
@@ -842,11 +1358,40 @@ cc_plugin_load()
 extern "C" void
 cc_plugin_register(cc::host_registry &r)
 {
-    r.types().register_value_type<std::string>("text");
-    r.types().register_value_type<std::filesystem::path>("path");
-    r.types().register_value_type<long>("int");
-    r.register_node_factory(std::make_unique<cc::basic::from_file_factory>());
-    r.register_node_factory(std::make_unique<cc::basic::constant_factory>());
-    r.register_node_factory(std::make_unique<cc::basic::view_factory>());
-    r.register_node_factory(std::make_unique<cc::basic::exec_factory>());
+    using namespace cc::basic;
+
+    // ---- vocabulary domains (this plugin is the seeder, not the owner) ----
+    r.register_domain({.id = "basic/types", .display_name = "Basic Types", .description = "String, Integer, Double, Boolean and the Any wildcard", .depends_on = {}, .provided_types = {}});
+    r.register_domain({.id = "filesystem", .display_name = "Filesystem", .description = "Path/File vocabulary: materialisation, inspection, text reading", .depends_on = {"basic/types"}, .provided_types = {}});
+    r.register_domain({.id = "basic/text", .display_name = "Text", .description = "String sources", .depends_on = {"basic/types"}, .provided_types = {}});
+    r.register_domain({.id = "basic/view", .display_name = "View", .description = "Debug taps for any value", .depends_on = {"basic/types"}, .provided_types = {}});
+    r.register_domain({.id = "system/process", .display_name = "Process", .description = "Subprocess execution", .depends_on = {"filesystem", "basic/types"}, .provided_types = {}});
+
+    // ---- value types, attributed to their domains ----
+    {
+        domain_scope ds {r};
+        r.push_domain("basic/types");
+        r.types().register_value_type<std::string>({.name = "String", .short_name = "str", .description = "UTF-8 text", .inline_control = cc::property_kind::text, .parse = parse_string});
+        r.types().register_value_type<long>({.name = "Integer", .short_name = "int", .description = "64-bit signed integer", .inline_control = cc::property_kind::integer, .parse = parse_integer});
+        r.types().register_value_type<double>({.name = "Double", .short_name = "double", .description = "64-bit floating point", .inline_control = cc::property_kind::text, .parse = parse_double});
+        r.types().register_value_type<bool>({.name = "Boolean", .short_name = "bool", .description = "true / false", .inline_control = cc::property_kind::boolean, .parse = parse_boolean});
+        r.types().register_value_type<std::monostate>({.name = "Any", .short_name = "any", .description = "Wildcard — accepts any value", .inline_control = {}, .parse = {}});
+    }
+    {
+        domain_scope ds {r};
+        r.push_domain("filesystem");
+        r.types().register_value_type<std::filesystem::path>({.name = "Path", .short_name = "path", .description = "Filesystem path (naming invariants only)", .inline_control = cc::property_kind::path, .parse = parse_path});
+        r.types().register_value_type<cc::fs::file_handle>({.name = "File", .short_name = "file", .description = "Materialised file handle with a metadata snapshot", .inline_control = {}, .parse = {}});
+        r.types().register_value_type<cc::fs::file_attrs>({.name = "FileAttrs", .short_name = "attrs", .description = "File metadata snapshot: size, permissions, modified", .inline_control = {}, .parse = {}});
+    }
+
+    // ---- node factories ----
+    r.register_node_factory(std::make_unique<path_factory>());
+    r.register_node_factory(std::make_unique<get_file_factory>());
+    r.register_node_factory(std::make_unique<get_or_create_factory>());
+    r.register_node_factory(std::make_unique<file_factory>());
+    r.register_node_factory(std::make_unique<read_text_factory>());
+    r.register_node_factory(std::make_unique<constant_factory>());
+    r.register_node_factory(std::make_unique<view_factory>());
+    r.register_node_factory(std::make_unique<exec_factory>());
 }

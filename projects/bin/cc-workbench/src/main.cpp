@@ -2979,28 +2979,35 @@ draw_view_window(ViewTab &tab)
 }
 
 // ---------------------------------------------------------------------------
-// Metadata tab — the pipeline document's vocabulary settings.
+// Metadata tab — vocabulary settings, split by environment.
+//
+// There are TWO environments: the HOST (everything loaded plugins and
+// runtime registrations offer this session) and the PROJECT (the domain
+// contract of the .pipeline file: root + imports). The node palette offers
+// exactly the project's vocabulary — editing the contract here re-shapes
+// the palette immediately, and the contract persists through save/load.
+// Typical workflow: add a domain the host can see, place its nodes, save;
+// later reopen, clean the dependent nodes (each import lists them), remove
+// the domain to free the dependency, save again.
 //
 // Sections:
-//   1. Contract — the current root domain (immutable) + imports (add-only,
-//      per plans/domains.md §3). Adding an import widens the palette of the
-//      create menu / drag palette immediately (visibility is recomputed
-//      per frame from {root ∪ imports}).
-//   2. Register domain — seed a custom vocabulary domain into the host
-//      registry at runtime (no plugin needed). Session-only: not persisted
-//      into the .pipeline file; imports of it survive on disk but warn on
-//      load after a restart.
-//   3. Registry — every loaded domain with its metadata, provided types and
-//      the node types that declared membership in it.
-//   4. Plugins — loaded plugin names with their node-type counts.
+//   1. Pipeline contract (PROJECT) — root (immutable) + imports: free to
+//      add; removable once no placed node depends on the domain (each
+//      import shows its dependent node types).
+//   2. Register domain (HOST) — seed a custom vocabulary domain at runtime
+//      (no plugin needed). Session-only: not persisted into the .pipeline
+//      file; imports of it survive on disk but warn on load after a restart.
+//   3. Domain registry (HOST) — every domain with its metadata, provided
+//      types and the node types that declared membership in it.
+//   4. Loaded plugins (HOST) — plugin names with their node-type counts.
 // ---------------------------------------------------------------------------
 void
 draw_metadata_window()
 {
     const auto &domains = g_state.host->domains();
 
-    // ---- 1. Document contract ----
-    ImGui::SeparatorText("Pipeline contract");
+    // ---- 1. Document contract (project environment) ----
+    ImGui::SeparatorText("Pipeline contract — project environment");
     if (g_state.domains.root.empty())
     {
         ImGui::TextWrapped("No domain contract yet — legacy (v1) pipeline or nothing opened.");
@@ -3015,22 +3022,20 @@ draw_metadata_window()
 
         ImGui::Spacing();
         ImGui::TextUnformatted("Imports:");
+        ImGui::TextDisabled("(project environment — free to edit; the palette follows this list, persisted in the file)");
         if (g_state.domains.imports.empty())
         {
             ImGui::TextDisabled("  (none)");
         }
-        // Removal is allowed while safe: after dropping the import, every
-        // node already placed on the canvas must stay visible (at least one
-        // of its own domains still within the shrunk closure). The precise
-        // check covers both nodes OF the domain and nodes that reached their
-        // vocabulary only through its transitive dependency chain.
+        // Each import lists the placed nodes that would become invisible
+        // without it — both nodes OF the domain and nodes that reached
+        // their vocabulary only through its transitive dependency chain.
+        // That list is exactly what to clean before removal unlocks.
         int remove_idx = -1;
         for (std::size_t i = 0; i < g_state.domains.imports.size(); ++i)
         {
             const std::string &imp = g_state.domains.imports[i];
             ImGui::PushID(imp.c_str());
-            ImGui::BulletText("%s", imp.c_str());
-            ImGui::SameLine();
 
             std::vector<std::string_view> roots;
             roots.push_back(g_state.domains.root);
@@ -3043,7 +3048,7 @@ draw_metadata_window()
             }
             const auto                  shrunk_v = g_state.host->domain_closure(roots);
             const std::set<std::string> still {shrunk_v.begin(), shrunk_v.end()};
-            std::vector<std::string>    orphans;
+            std::set<std::string>       orphans;
             for (const auto &np : g_state.g.nodes())
             {
                 bool visible = false;
@@ -3060,12 +3065,14 @@ draw_metadata_window()
                 }
                 if (!visible)
                 {
-                    orphans.emplace_back(np->type_id());
+                    orphans.emplace(np->type_id());
                 }
             }
 
             if (orphans.empty())
             {
+                ImGui::BulletText("%s — no dependent nodes", imp.c_str());
+                ImGui::SameLine();
                 if (ImGui::SmallButton("remove"))
                 {
                     remove_idx = static_cast<int>(i);
@@ -3073,12 +3080,34 @@ draw_metadata_window()
             }
             else
             {
+                std::string names;
+                std::size_t shown = 0;
+                for (const auto &o : orphans)
+                {
+                    if (shown++ == 4)
+                    {
+                        names += ", …";
+                        break;
+                    }
+                    if (!names.empty())
+                    {
+                        names += ", ";
+                    }
+                    names += o;
+                }
+                ImGui::BulletText("%s — %zu node type(s): %s", imp.c_str(), orphans.size(), names.c_str());
+                ImGui::SameLine();
                 ImGui::BeginDisabled();
                 ImGui::SmallButton("remove");
                 ImGui::EndDisabled();
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                 {
-                    ImGui::SetTooltip("removing would hide %zu placed node(s) from the palette\n(first: %s)", orphans.size(), orphans.front().c_str());
+                    std::string tip = "delete these nodes first — removing now would hide them from the palette:";
+                    for (const auto &o : orphans)
+                    {
+                        tip += "\n  • " + o;
+                    }
+                    ImGui::SetTooltip("%s", tip.c_str());
                 }
             }
             ImGui::PopID();
@@ -3137,8 +3166,8 @@ draw_metadata_window()
         }
     }
 
-    // ---- 2. Register a custom domain ----
-    ImGui::SeparatorText("Register domain");
+    // ---- 2. Register a custom domain (host environment) ----
+    ImGui::SeparatorText("Register domain — host environment");
     static char                  dom_id[128]   = "";
     static char                  dom_name[128] = "";
     static char                  dom_desc[256] = "";
@@ -3216,8 +3245,8 @@ draw_metadata_window()
     }
     ImGui::TextDisabled("Runtime domains live until the app closes — they are not persisted in the .pipeline file.");
 
-    // ---- 3. Domain registry ----
-    ImGui::SeparatorText("Domain registry");
+    // ---- 3. Domain registry (host environment) ----
+    ImGui::SeparatorText("Domain registry — host environment");
     if (domains.empty())
     {
         ImGui::TextDisabled("(no domains registered — load a plugin that seeds one)");
@@ -3288,8 +3317,8 @@ draw_metadata_window()
         ImGui::Unindent();
     }
 
-    // ---- 4. Loaded plugins ----
-    ImGui::SeparatorText("Loaded plugins");
+    // ---- 4. Loaded plugins (host environment) ----
+    ImGui::SeparatorText("Loaded plugins — host environment");
     for (const auto &name : g_state.host->loaded_plugins())
     {
         std::size_t count = 0;

@@ -1077,36 +1077,12 @@ pin_annotation_of(const cc::slot *s) -> std::string
 // Inline pin-value editor — compact widget rendered INSIDE the pin row
 // (form F2/F3 of the closed pin-form set: unconnected input whose type has
 // an inline editor). Placeholder carries the type hint ":short". The wire
-// wins: a connected pin renders an inert spacer of the same width instead.
-//
-// The editable region has a FIXED width per editor kind (input + browse
-// button for path-like kinds) so the node neither jumps when a value is
-// typed/cleared nor breathes when a wire is connected/disconnected.
-// New editor kinds (dropdown, slider, ...) extend cc::property_kind + the
-// switch in ONE place.
+// wins: when the pin is connected the caller wraps the editor in
+// BeginDisabled — the SAME widgets render in both states, so the node's
+// width and height stay pixel-stable across connect/disconnect (Blender's
+// greyed default-value field). New editor kinds (dropdown, slider, ...)
+// extend cc::property_kind + the switch in ONE place.
 // ---------------------------------------------------------------------------
-
-// Width of the fixed inline-editor slot for a control kind, including the
-// browse button where the kind has one.
-auto
-inline_slot_width(cc::property_kind kind) -> float
-{
-    const float browse = ImGui::GetStyle().ItemSpacing.x + ImGui::GetFrameHeight() + 6.0f;
-    switch (kind)
-    {
-    case cc::property_kind::boolean:
-        return ImGui::GetFrameHeight() + 8.0f; // checkbox box
-    case cc::property_kind::integer:
-        return 72.0f;
-    case cc::property_kind::path:
-        return 140.0f + browse;
-    case cc::property_kind::multiline:
-    case cc::property_kind::text:
-    default:
-        return 140.0f;
-    }
-}
-
 void
 draw_inline_pin_widget(cc::node &n, const cc::slot &s)
 {
@@ -1633,13 +1609,14 @@ draw_node(cc::node &n)
         IconType pin_icon  = icon_for_type(type_name);
         auto     annot     = pin_annotation_of(slot);
 
-        // Pin forms (closed set): a connected input renders bare (F1 — the
-        // wire wins); an unconnected input whose type has an inline editor
-        // renders the editor inside the row (F2 empty / F3 filled); inputs
-        // of opaque types keep the type annotation (F4/F5).
-        const bool has_editor   = g_state.host->types().inline_editor_of(slot->type()).has_value();
-        const bool connected    = g_state.g.find_source(std::string {n.instance_id()}, slot->id()).has_value();
-        const bool editable_row = has_editor && !connected;
+        // Pin forms (closed set): an input whose type has an inline editor
+        // ALWAYS renders the editor in the row — when a wire is connected
+        // the editor is greyed out via BeginDisabled (Blender semantics:
+        // the default-value field stays visible but inert, the wire wins).
+        // Rendering the same widgets in both states keeps the node's width
+        // AND height pixel-stable across connect/disconnect.
+        const bool has_editor = g_state.host->types().inline_editor_of(slot->type()).has_value();
+        const bool connected  = g_state.g.find_source(std::string {n.instance_id()}, slot->id()).has_value();
 
         b.Input(pin_id);
         Icon(ImVec2(16, 16), pin_icon, true, pin_color, ImVec4(0, 0, 0, 0));
@@ -1656,7 +1633,7 @@ draw_node(cc::node &n)
             dl->AddRectFilled(icon_min - pad, icon_max + pad, ImColor(pin_color.x, pin_color.y, pin_color.z, 0.30f), 4.0f);
             dl->AddRect(icon_min - pad, icon_max + pad, ImColor(pin_color.x, pin_color.y, pin_color.z, 0.80f), 4.0f);
         }
-        if (editable_row)
+        if (has_editor)
         {
             // Constrain the pin to the icon BEFORE ending it: bounds drive
             // the hit-test and the wire pivot. Without this the default
@@ -1670,17 +1647,17 @@ draw_node(cc::node &n)
         }
         ImGui::Spring(0);
         ImGui::TextUnformatted(slot->id().data());
-        if (editable_row)
+        if (has_editor)
         {
+            if (connected)
+            {
+                ImGui::BeginDisabled();
+            }
             draw_inline_pin_widget(n, *slot);
-        }
-        else if (has_editor)
-        {
-            // F1 wired: the wire wins — the editor is gone, but the slot's
-            // FIXED width is reserved as an inert spacer so connecting /
-            // disconnecting does not change the node's width.
-            ImGui::Spring(0);
-            ImGui::Dummy(ImVec2(inline_slot_width(*g_state.host->types().inline_editor_of(slot->type())), 1.0f));
+            if (connected)
+            {
+                ImGui::EndDisabled();
+            }
         }
         else
         {

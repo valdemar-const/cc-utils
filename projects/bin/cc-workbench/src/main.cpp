@@ -1074,20 +1074,49 @@ pin_annotation_of(const cc::slot *s) -> std::string
 }
 
 // ---------------------------------------------------------------------------
-// Inline pin-value editor — compact widget rendered INSIDE the pin row
-// (form F2/F3 of the closed pin-form set: unconnected input whose type has
-// an inline editor). Placeholder carries the type hint ":short". The wire
-// wins: when the pin is connected the caller wraps the editor in
-// BeginDisabled — the SAME widgets render in both states, so the node's
-// width and height stay pixel-stable across connect/disconnect (Blender's
-// greyed default-value field). New editor kinds (dropdown, slider, ...)
-// extend cc::property_kind + the switch in ONE place.
+// Pin value field — the tail of an input pin row, rendered in one of a
+// CLOSED set of display modes (see pin_row_mode below). The set of editor
+// KINDS is open (registered per connection type — potentially several per
+// type later; whichever is active renders from the same anchor position,
+// exactly one visible at a time). Placeholder carries the type hint
+// ":short".
+//
+// The `ghost` mode is the ImGui measure-only dry run: the same widget calls
+// execute inside a degenerate clip rect, so ItemSize reserves the exact
+// geometry (width AND height, pixel-stable node) while ItemAdd culls every
+// draw primitive — the editor vanishes without painting a single pixel and
+// without any interaction. This is the idiomatic replacement for "render
+// all alternatives, keep the active one visible".
 // ---------------------------------------------------------------------------
-void
-draw_inline_pin_widget(cc::node &n, const cc::slot &s)
+enum class pin_row_mode
 {
-    const auto  kind = *g_state.host->types().inline_editor_of(s.type());
+    editor,    // live inline editor (unconnected pin)
+    ghost,     // measure-only: geometry reserved, zero pixels, inert
+    annotation // `:short` type label, for types without an editor
+};
+
+void
+draw_pin_value_field(cc::node &n, const cc::slot &s, pin_row_mode mode)
+{
+    if (mode == pin_row_mode::annotation)
+    {
+        ImGui::Spring(0);
+        ImGui::TextDisabled("%s", pin_annotation_of(&s).c_str());
+        return;
+    }
+
+    const auto  kind  = *g_state.host->types().inline_editor_of(s.type());
+    const bool  ghost = (mode == pin_row_mode::ghost);
     std::string current {n.slot_values().get(s.id())};
+
+    if (ghost)
+    {
+        // Degenerate (zero-area) clip rect: widgets below still run and
+        // ItemSize still measures them, but every item reports fully
+        // clipped → ItemAdd returns false → widgets early-out before
+        // submitting any draw primitive or taking any interaction.
+        ImGui::GetWindowDrawList()->PushClipRect(ImVec2(0.0f, 0.0f), ImVec2(0.0f, 0.0f), false);
+    }
 
     ImGui::PushID(s.id().data());
     switch (kind)
@@ -1145,6 +1174,11 @@ draw_inline_pin_widget(cc::node &n, const cc::slot &s)
         }
     }
     ImGui::PopID();
+
+    if (ghost)
+    {
+        ImGui::GetWindowDrawList()->PopClipRect();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1609,14 +1643,15 @@ draw_node(cc::node &n)
         IconType pin_icon  = icon_for_type(type_name);
         auto     annot     = pin_annotation_of(slot);
 
-        // Pin forms (closed set): an input whose type has an inline editor
-        // ALWAYS renders the editor in the row — when a wire is connected
-        // the editor is greyed out via BeginDisabled (Blender semantics:
-        // the default-value field stays visible but inert, the wire wins).
-        // Rendering the same widgets in both states keeps the node's width
-        // AND height pixel-stable across connect/disconnect.
+        // Pin-row display mode (closed variant set, see draw_pin_value_field):
+        // a connected input ghosts its editor — same widgets, measure-only,
+        // zero pixels, no interaction — so the node stays pixel-stable across
+        // connect/disconnect while the wire wins.
         const bool has_editor = g_state.host->types().inline_editor_of(slot->type()).has_value();
         const bool connected  = g_state.g.find_source(std::string {n.instance_id()}, slot->id()).has_value();
+        const auto row_mode   = !has_editor ? pin_row_mode::annotation
+                              : connected   ? pin_row_mode::ghost
+                                            : pin_row_mode::editor;
 
         b.Input(pin_id);
         Icon(ImVec2(16, 16), pin_icon, true, pin_color, ImVec4(0, 0, 0, 0));
@@ -1647,23 +1682,7 @@ draw_node(cc::node &n)
         }
         ImGui::Spring(0);
         ImGui::TextUnformatted(slot->id().data());
-        if (has_editor)
-        {
-            if (connected)
-            {
-                ImGui::BeginDisabled();
-            }
-            draw_inline_pin_widget(n, *slot);
-            if (connected)
-            {
-                ImGui::EndDisabled();
-            }
-        }
-        else
-        {
-            ImGui::Spring(0);
-            ImGui::TextDisabled("%s", annot.c_str());
-        }
+        draw_pin_value_field(n, *slot, row_mode);
         b.EndInput();
     }
 

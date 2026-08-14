@@ -21,6 +21,7 @@
 #include <cc/ir.hpp>               // cc::ir::module for IR view renderer
 #include <cc/types/filesystem.hpp> // cc::fs::file_handle / file_attrs for File views
 
+#define IMGUI_DEFINE_MATH_OPERATORS
 #include "hello_imgui/hello_imgui.h"
 #include "imgui-node-editor/imgui_node_editor.h"
 #include "imgui_stacklayout.h" // ImGui::Spring
@@ -1642,12 +1643,24 @@ draw_node(cc::node &n)
 
         b.Input(pin_id);
         Icon(ImVec2(16, 16), pin_icon, true, pin_color, ImVec4(0, 0, 0, 0));
+        // Custom hover feedback: a soft type-coloured halo behind the icon.
+        // Drawn here in the node's own content (NOT the editor's pin channel
+        // — the built-in PinRect highlight renders above interactive inline
+        // editors and had to be silenced, see StyleColor_PinRect* setup).
+        if (ed::GetHoveredPin() == ed::PinId(pin_id))
+        {
+            const ImVec2 icon_min = ImGui::GetItemRectMin();
+            const ImVec2 icon_max = ImGui::GetItemRectMax();
+            const ImVec2 pad      = ImVec2(4.0f, 4.0f);
+            auto        *dl       = ImGui::GetWindowDrawList();
+            dl->AddRectFilled(icon_min - pad, icon_max + pad, ImColor(pin_color.x, pin_color.y, pin_color.z, 0.30f), 4.0f);
+            dl->AddRect(icon_min - pad, icon_max + pad, ImColor(pin_color.x, pin_color.y, pin_color.z, 0.80f), 4.0f);
+        }
         if (editable_row)
         {
             // Constrain the pin to the icon BEFORE ending it: bounds drive
-            // the hover highlight (drawn in the pin channel ON TOP of node
-            // content), the hit-test and the wire pivot. Without this the
-            // default group rect bleeds over the inline editor row.
+            // the hit-test and the wire pivot. Without this the default
+            // group rect bleeds over the inline editor row.
             const ImVec2 icon_min = ImGui::GetItemRectMin();
             const ImVec2 icon_max = ImGui::GetItemRectMax();
             ed::PinRect(icon_min, icon_max);
@@ -1694,6 +1707,15 @@ draw_node(cc::node &n)
         ImGui::TextUnformatted(op.slot->id().data());
         ImGui::Spring(0);
         Icon(ImVec2(16, 16), pin_icon, true, pin_color, ImVec4(0, 0, 0, 0));
+        if (ed::GetHoveredPin() == ed::PinId(op.id))
+        {
+            const ImVec2 icon_min = ImGui::GetItemRectMin();
+            const ImVec2 icon_max = ImGui::GetItemRectMax();
+            const ImVec2 pad      = ImVec2(4.0f, 4.0f);
+            auto        *dl       = ImGui::GetWindowDrawList();
+            dl->AddRectFilled(icon_min - pad, icon_max + pad, ImColor(pin_color.x, pin_color.y, pin_color.z, 0.30f), 4.0f);
+            dl->AddRect(icon_min - pad, icon_max + pad, ImColor(pin_color.x, pin_color.y, pin_color.z, 0.80f), 4.0f);
+        }
         b.EndOutput();
     }
 
